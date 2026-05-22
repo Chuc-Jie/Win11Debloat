@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 setlocal EnableDelayedExpansion
 
 :: Set Windows Terminal installation paths. (Default and Scoop installation)
@@ -15,7 +15,7 @@ if exist "%wtDefaultPath%" (
 ) else if exist "%wtScoopPath%" (
     set "wtPath=%wtScoopPath%"
 ) else (
-    echo Windows Terminal not found, using default PowerShell.
+    echo 未找到 Windows Terminal，将使用默认的 PowerShell。
     set "wtPath="
 )
 
@@ -25,14 +25,14 @@ if defined wtPath (
     PowerShell -Command "Start-Process -FilePath '%wtPath%' -ArgumentList 'PowerShell -NoProfile -ExecutionPolicy Bypass -File ""%~dp0Win11Debloat.ps1""' -Verb RunAs" >> "%logFile%" || call :Error "PowerShell command failed"
     call :Log Script execution passed successfully to Win11Debloat.ps1
 ) else (
-    echo Windows Terminal not found. Using default PowerShell to launch Win11Debloat.ps1...
+    echo 未找到 Windows Terminal。将使用默认的 PowerShell 启动 Win11Debloat.ps1...
     call :Log Windows Terminal not found. Using default PowerShell to launch Win11Debloat.ps1...
     PowerShell -ExecutionPolicy Bypass -Command "& {Start-Process PowerShell -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File ""%~dp0Win11Debloat.ps1""' -Verb RunAs}" >> "%logFile%" || call :Error "PowerShell command failed"
     call :Log Script execution passed successfully to Win11Debloat.ps1
 )
 
 echo.
-echo For further help, please submit an issue at:
+echo 如需进一步帮助，请到以下地址提交 issue：
 echo https://github.com/Raphire/Win11Debloat/issues
 goto :EOF
 
@@ -42,7 +42,7 @@ echo %* >> "%logFile%"
 goto :EOF
 :: Error Handler
 :Error
-echo Error: %*
-echo Logged to %logFile%
+echo 错误：%*
+echo 已记录到 %logFile%
 pause
 goto :EOF

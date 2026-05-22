@@ -1,0 +1,47 @@
+﻿function Test-TargetUserName {
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$UserName
+    )
+
+    $normalizedUserName = if ($null -ne $UserName) { $UserName.Trim() } else { '' }
+
+    if ([string]::IsNullOrWhiteSpace($normalizedUserName)) {
+        return [PSCustomObject]@{
+            IsValid = $false
+            UserName = $normalizedUserName
+            Message = '请输入用户名'
+        }
+    }
+
+    if ($normalizedUserName -eq $env:USERNAME) {
+        return [PSCustomObject]@{
+            IsValid = $false
+            UserName = $normalizedUserName
+            Message = "不能输入您自己的用户名，请改用「当前用户」选项"
+        }
+    }
+
+    if (-not (CheckIfUserExists -userName $normalizedUserName)) {
+        return [PSCustomObject]@{
+            IsValid = $false
+            UserName = $normalizedUserName
+            Message = '未找到该用户，请输入有效的用户名'
+        }
+    }
+
+    if (TestIfUserIsLoggedIn -Username $normalizedUserName) {
+        return [PSCustomObject]@{
+            IsValid = $false
+            UserName = $normalizedUserName
+            Message = "用户 '$normalizedUserName' 当前已登录。请先注销该用户。"
+        }
+    }
+
+    return [PSCustomObject]@{
+        IsValid = $true
+        UserName = $normalizedUserName
+        Message = "找到用户：$normalizedUserName"
+    }
+}

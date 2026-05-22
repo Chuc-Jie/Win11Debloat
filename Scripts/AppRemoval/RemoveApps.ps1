@@ -9,6 +9,9 @@ function RemoveApps {
 
     $appIndex = 0
     $appCount = @($appsList).Count
+    $edgeIds = @('Microsoft.Edge', 'XPFFTQ037JWMHS')
+    $edgeUninstallSucceeded = $false
+    $edgeScheduledTaskAdded = $false
 
     Foreach ($app in $appsList) {
         if ($script:CancelRequested) {
@@ -19,26 +22,33 @@ function RemoveApps {
 
         # Update step name and sub-progress to show which app is being removed (only for bulk removal)
         if ($script:ApplySubStepCallback -and $appCount -gt 1) {
-            & $script:ApplySubStepCallback "正在卸载应用 ($appIndex/$appCount)" $appIndex $appCount
+            & $script:ApplySubStepCallback "正在移除应用 ($appIndex/$appCount)" $appIndex $appCount
         }
 
-        Write-Host "正在尝试卸载 $app..."
+        Write-Host "正在尝试移除 $app..."
 
         # Use WinGet only to remove OneDrive and Edge
-        if (($app -eq "Microsoft.OneDrive") -or ($app -eq "Microsoft.Edge")) {
+        if (($app -eq "Microsoft.OneDrive") -or ($edgeIds -contains $app)) {
             if ($script:WingetInstalled -eq $false) {
-                Write-Host "WinGet 未安装或版本过旧，无法卸载 $app" -ForegroundColor Red
+                Write-Host "WinGet 未安装或版本过旧，无法移除 $app" -ForegroundColor Red
                 continue
             }
 
-            $appName = $app -replace '\.', '_'
+            $isEdgeId = $edgeIds -contains $app
+            $appName = if ($isEdgeId) { 'Microsoft_Edge' } else { $app -replace '\.', '_' }
 
             # Uninstall app via WinGet, or create a scheduled task to uninstall it later
             if ($script:Params.ContainsKey("User")) {
-                ImportRegistryFile "正在添加计划任务以卸载用户 $(GetUserName) 的 $app..." "Uninstall_$($appName).reg"
+                if (-not ($isEdgeId -and $edgeScheduledTaskAdded)) {
+                    ImportRegistryFile "正在为用户 $(GetUserName) 添加用于卸载 $app 的计划任务..." "Uninstall_$($appName).reg"
+                    if ($isEdgeId) { $edgeScheduledTaskAdded = $true }
+                }
             }
             elseif ($script:Params.ContainsKey("Sysprep")) {
-                ImportRegistryFile "正在添加计划任务以在新用户登录后卸载 $app..." "Uninstall_$($appName).reg"
+                if (-not ($isEdgeId -and $edgeScheduledTaskAdded)) {
+                    ImportRegistryFile "正在添加用于在新用户登录后卸载 $app 的计划任务..." "Uninstall_$($appName).reg"
+                    if ($isEdgeId) { $edgeScheduledTaskAdded = $true }
+                }
             }
             else {
                 # Uninstall app via WinGet
@@ -47,20 +57,34 @@ function RemoveApps {
                     winget uninstall --accept-source-agreements --disable-interactivity --id $appId
                 } -ArgumentList $app
 
-                If (($app -eq "Microsoft.Edge") -and (Select-String -InputObject $wingetOutput -Pattern "Uninstall failed with exit code")) {
-                    Write-Host "无法通过 WinGet 卸载 Microsoft Edge" -ForegroundColor Red
+                $wingetFailed = Select-String -InputObject $wingetOutput -Pattern "Uninstall failed with exit code|No installed package found matching input criteria|No package found matching input criteria" -SimpleMatch:$false
+                if ($isEdgeId) {
+                    if (-not $wingetFailed) {
+                        $edgeUninstallSucceeded = $true
+                    }
 
-                    if ($script:GuiWindow) {
-                        $result = Show-MessageBox -Message '无法通过 WinGet 卸载 Microsoft Edge。是否要强制卸载？不推荐！' -Title '强制卸载 Microsoft Edge？' -Button 'YesNo' -Icon 'Warning'
+                    # Prompt immediately after the final selected Edge ID attempt (if all attempts failed)
+                    $hasRemainingEdgeIds = $false
+                    if ($appIndex -lt $appCount) {
+                        $remainingApps = @($appsList)[($appIndex)..($appCount - 1)]
+                        $hasRemainingEdgeIds = @($remainingApps | Where-Object { $edgeIds -contains $_ }).Count -gt 0
+                    }
 
-                        if ($result -eq 'Yes') {
+                    if (-not $hasRemainingEdgeIds -and -not $edgeUninstallSucceeded) {
+                        Write-Host "无法通过 WinGet 卸载 Microsoft Edge" -ForegroundColor Red
+
+                        if ($script:GuiWindow) {
+                            $result = Show-MessageBox -Message '无法通过 WinGet 卸载 Microsoft Edge。是否强制卸载？不推荐！' -Title '强制卸载 Microsoft Edge？' -Button 'YesNo' -Icon 'Warning'
+
+                            if ($result -eq 'Yes') {
+                                Write-Host ""
+                                ForceRemoveEdge
+                            }
+                        }
+                        elseif ($( Read-Host -Prompt "是否强制卸载 Microsoft Edge？不推荐！(y/n)" ) -eq 'y') {
                             Write-Host ""
                             ForceRemoveEdge
                         }
-                    }
-                    elseif ($( Read-Host -Prompt "是否要强制卸载 Microsoft Edge？不推荐！(y/n)" ) -eq 'y') {
-                        Write-Host ""
-                        ForceRemoveEdge
                     }
                 }
             }
@@ -101,7 +125,7 @@ function RemoveApps {
         }
         catch {
             if ($DebugPreference -ne "SilentlyContinue") {
-                Write-Host "尝试卸载 $app 时出现问题" -ForegroundColor Yellow
+                Write-Host "尝试移除 $app 时出现错误" -ForegroundColor Yellow
                 Write-Host $psitem.Exception.StackTrace -ForegroundColor Gray
             }
         }

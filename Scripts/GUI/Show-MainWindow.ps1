@@ -1,5 +1,71 @@
-﻿function Show-MainWindow {    
+﻿function Show-MainWindow {
     Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase,System.Windows.Forms | Out-Null
+
+    # Helper to constrain the maximized window to the monitor working area (respects taskbar).
+    # Required for WindowStyle=None windows — without this the window extends behind the taskbar.
+    if (-not ([System.Management.Automation.PSTypeName]'Win11Debloat.MaximizedWindowHelper').Type) {
+        Add-Type -Namespace Win11Debloat -Name MaximizedWindowHelper `
+            -ReferencedAssemblies 'PresentationFramework','System.Windows.Forms','System.Drawing' `
+            -MemberDefinition @'
+            [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+            private struct MINMAXINFO {
+                public POINT ptReserved, ptMaxSize, ptMaxPosition, ptMinTrackSize, ptMaxTrackSize;
+            }
+            [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+            private struct POINT { public int x, y; }
+
+            [System.Runtime.InteropServices.DllImport("user32.dll")]
+            private static extern System.IntPtr MonitorFromWindow(System.IntPtr hwnd, uint dwFlags);
+
+            [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+            private static extern bool GetMonitorInfo(System.IntPtr hMonitor, ref MONITORINFO lpmi);
+
+            [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+            private struct RECT {
+                public int Left, Top, Right, Bottom;
+            }
+
+            [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+            private struct MONITORINFO {
+                public int cbSize;
+                public RECT rcMonitor;
+                public RECT rcWork;
+                public uint dwFlags;
+            }
+
+            public static System.IntPtr WmGetMinMaxInfoHook(
+                System.IntPtr hwnd, int msg, System.IntPtr wParam, System.IntPtr lParam, ref bool handled) {
+                if (msg == 0x0024) { // WM_GETMINMAXINFO
+                    var mmi = (MINMAXINFO)System.Runtime.InteropServices.Marshal.PtrToStructure(
+                        lParam, typeof(MINMAXINFO));
+
+                    const uint MONITOR_DEFAULTTONEAREST = 0x00000002;
+                    var monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                    var monitorInfo = new MONITORINFO();
+                    monitorInfo.cbSize = System.Runtime.InteropServices.Marshal.SizeOf(typeof(MONITORINFO));
+
+                    if (monitor != System.IntPtr.Zero && GetMonitorInfo(monitor, ref monitorInfo)) {
+                        mmi.ptMaxPosition.x = monitorInfo.rcWork.Left - monitorInfo.rcMonitor.Left;
+                        mmi.ptMaxPosition.y = monitorInfo.rcWork.Top - monitorInfo.rcMonitor.Top;
+                        mmi.ptMaxSize.x     = monitorInfo.rcWork.Right - monitorInfo.rcWork.Left;
+                        mmi.ptMaxSize.y     = monitorInfo.rcWork.Bottom - monitorInfo.rcWork.Top;
+                    }
+                    else {
+                        var screen = System.Windows.Forms.Screen.FromHandle(hwnd);
+                        var wa = screen.WorkingArea;
+                        var bounds = screen.Bounds;
+                        mmi.ptMaxPosition.x = wa.Left - bounds.Left;
+                        mmi.ptMaxPosition.y = wa.Top - bounds.Top;
+                        mmi.ptMaxSize.x     = wa.Width;
+                        mmi.ptMaxSize.y     = wa.Height;
+                    }
+
+                    System.Runtime.InteropServices.Marshal.StructureToPtr(mmi, lParam, true);
+                }
+                return System.IntPtr.Zero;
+            }
+'@
+    }
 
     # Get current Windows build version
     $WinVersion = Get-ItemPropertyValue 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' CurrentBuild
@@ -19,7 +85,8 @@
     SetWindowThemeResources -window $window -usesDarkMode $usesDarkMode
 
     # Get named elements
-    $titleBar = $window.FindName('TitleBar')
+    $mainBorder = $window.FindName('MainBorder')
+    $titleBarBackground = $window.FindName('TitleBarBackground')
     $kofiBtn = $window.FindName('KofiBtn')
     $menuBtn = $window.FindName('MenuBtn')
     $closeBtn = $window.FindName('CloseBtn')
@@ -27,11 +94,125 @@
     $menuReportBug = $window.FindName('MenuReportBug')
     $menuLogs = $window.FindName('MenuLogs')
     $menuAbout = $window.FindName('MenuAbout')
+    $importConfigBtn = $window.FindName('ImportConfigBtn')
+    $exportConfigBtn = $window.FindName('ExportConfigBtn')
+    $restoreBackupBtn = $window.FindName('RestoreBackupBtn')
 
-    # Title bar event handlers
-    $titleBar.Add_MouseLeftButtonDown({
-        if ($_.OriginalSource -is [System.Windows.Controls.Grid] -or $_.OriginalSource -is [System.Windows.Controls.Border] -or $_.OriginalSource -is [System.Windows.Controls.TextBlock]) {
-            $window.DragMove()
+    $windowStateNormal = [System.Windows.WindowState]::Normal
+    $windowStateMaximized = [System.Windows.WindowState]::Maximized
+    $normalWindowShadow = $mainBorder.Effect
+    $initialNormalMaxWidth = 1400.0
+
+    $convertScreenPointToDip = {
+        param(
+            [double]$x,
+            [double]$y
+        )
+
+        $source = [System.Windows.PresentationSource]::FromVisual($window)
+        if ($null -eq $source -or $null -eq $source.CompositionTarget) {
+            return [System.Windows.Point]::new($x, $y)
+        }
+
+        return $source.CompositionTarget.TransformFromDevice.Transform([System.Windows.Point]::new($x, $y))
+    }
+
+    $convertScreenPixelsToDip = {
+        param(
+            [double]$width,
+            [double]$height
+        )
+
+        $topLeft = & $convertScreenPointToDip 0 0
+        $bottomRight = & $convertScreenPointToDip $width $height
+        return [System.Windows.Size]::new($bottomRight.X - $topLeft.X, $bottomRight.Y - $topLeft.Y)
+    }
+
+    $getWindowScreen = {
+        $hwnd = (New-Object System.Windows.Interop.WindowInteropHelper($window)).Handle
+        if ($hwnd -eq [IntPtr]::Zero) {
+            return $null
+        }
+
+        return [System.Windows.Forms.Screen]::FromHandle($hwnd)
+    }
+
+    $updateWindowChrome = {
+        $chrome = [System.Windows.Shell.WindowChrome]::GetWindowChrome($window)
+        if ($window.WindowState -eq $windowStateMaximized) {
+            $mainBorder.Margin = [System.Windows.Thickness]::new(0)
+            $mainBorder.BorderThickness = [System.Windows.Thickness]::new(0)
+            $mainBorder.CornerRadius = [System.Windows.CornerRadius]::new(0)
+            $mainBorder.Effect = $null
+            $titleBarBackground.CornerRadius = [System.Windows.CornerRadius]::new(0)
+            # Zero out resize borders when maximized so the entire title bar row is draggable
+            if ($chrome) { $chrome.ResizeBorderThickness = [System.Windows.Thickness]::new(0) }
+        }
+        else {
+            $mainBorder.Margin = [System.Windows.Thickness]::new(0)
+            $mainBorder.BorderThickness = [System.Windows.Thickness]::new(1)
+            $mainBorder.CornerRadius = [System.Windows.CornerRadius]::new(8)
+            $mainBorder.Effect = $normalWindowShadow
+            $titleBarBackground.CornerRadius = [System.Windows.CornerRadius]::new(8, 8, 0, 0)
+            if ($chrome) { $chrome.ResizeBorderThickness = [System.Windows.Thickness]::new(5) }
+        }
+    }
+
+    $applyInitialWindowSize = {
+        if ($window.WindowState -ne $windowStateNormal) {
+            return
+        }
+
+        $screen = & $getWindowScreen
+        if ($null -eq $screen) {
+            return
+        }
+
+        $workingAreaTopLeftDip = & $convertScreenPointToDip $screen.WorkingArea.Left $screen.WorkingArea.Top
+        $workingAreaDip = & $convertScreenPixelsToDip $screen.WorkingArea.Width $screen.WorkingArea.Height
+        $window.Width = [Math]::Min($initialNormalMaxWidth, $workingAreaDip.Width)
+        $window.Left = $workingAreaTopLeftDip.X + (($workingAreaDip.Width - $window.Width) / 2)
+    }
+
+    $window.Add_SourceInitialized({
+        & $applyInitialWindowSize
+        & $updateWindowChrome
+
+        # Register WM_GETMINMAXINFO hook so maximizing respects the working area (taskbar)
+        $hwndHelper = New-Object System.Windows.Interop.WindowInteropHelper($window)
+        $hwndSource = [System.Windows.Interop.HwndSource]::FromHwnd($hwndHelper.Handle)
+        $hookMethod = [Win11Debloat.MaximizedWindowHelper].GetMethod('WmGetMinMaxInfoHook')
+        $hook = [System.Delegate]::CreateDelegate([System.Windows.Interop.HwndSourceHook], $hookMethod)
+        $hwndSource.AddHook($hook)
+    })
+
+    $contentGrid = $window.FindName('ContentGrid')
+    $maxContentWidth = 1600.0
+
+    $updateContentMargin = {
+        $w = $window.ActualWidth
+        if ($w -gt $maxContentWidth) {
+            $gutter = [Math]::Floor(($w - $maxContentWidth) / 2)
+            $contentGrid.Margin = [System.Windows.Thickness]::new($gutter, 0, $gutter, 0)
+        } else {
+            $contentGrid.Margin = [System.Windows.Thickness]::new(0)
+        }
+    }
+
+    $window.Add_SizeChanged({
+        & $updateContentMargin
+        UpdateTweaksResponsiveColumns
+    })
+
+    $window.Add_StateChanged({
+        & $updateWindowChrome
+    })
+
+    $window.Add_LocationChanged({
+        # Nudge the popup offset to force WPF to recalculate its screen position
+        if ($script:BubblePopup -and $script:BubblePopup.IsOpen) {
+            $script:BubblePopup.HorizontalOffset += 1
+            $script:BubblePopup.HorizontalOffset -= 1
         }
     })
     
@@ -54,18 +235,57 @@
     })
 
     $menuLogs.Add_Click({
-        $logsFolder = Join-Path $PSScriptRoot "../../Logs"
+        $logsFolder = Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) 'Logs'
         if (Test-Path $logsFolder) {
             Start-Process "explorer.exe" -ArgumentList $logsFolder
         }
         else {
-            Show-MessageBox -Message "No logs folder found at: $logsFolder" -Title "Logs" -Button 'OK' -Icon 'Information'
+            Show-MessageBox -Message "未在以下位置找到日志文件夹：$logsFolder" -Title "日志" -Button 'OK' -Icon 'Information'
         }
     })
 
     $menuAbout.Add_Click({
         Show-AboutDialog -Owner $window
     })
+
+    $exportConfigBtn.Add_Click({
+        try {
+            Export-Configuration -Owner $window -UsesDarkMode $usesDarkMode -AppsPanel $appsPanel -UiControlMappings $script:UiControlMappings -UserSelectionCombo $userSelectionCombo -OtherUsernameTextBox $otherUsernameTextBox
+        }
+        catch {
+            Write-Warning "导出配置失败：$($_.Exception.Message)"
+            Show-MessageBox -Owner $window -Message "无法打开导出配置对话框：$($_.Exception.Message)" -Title '导出配置失败' -Button 'OK' -Icon 'Error' | Out-Null
+        }
+    })
+
+    $importConfigBtn.Add_Click({
+        try {
+            Import-Configuration -Owner $window -UsesDarkMode $usesDarkMode -AppsPanel $appsPanel -UiControlMappings $script:UiControlMappings -UserSelectionCombo $userSelectionCombo -OtherUsernameTextBox $otherUsernameTextBox -OnAppsImported { UpdateAppSelectionStatus; UpdatePresetStates } -OnImportCompleted {
+                $tabControl.SelectedIndex = 3
+                UpdateNavigationButtons
+
+                $window.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Loaded, [action]{
+                    Show-Bubble -TargetControl $reviewChangesBtn -Message '在此查看所选变更'
+                }) | Out-Null
+            }
+        }
+        catch {
+            Write-Warning "导入配置失败：$($_.Exception.Message)"
+            Show-MessageBox -Owner $window -Message "无法打开导入配置对话框：$($_.Exception.Message)" -Title '导入配置失败' -Button 'OK' -Icon 'Error' | Out-Null
+        }
+    })
+
+    if ($restoreBackupBtn) {
+        $restoreBackupBtn.Add_Click({
+            try {
+                Show-RestoreBackupWindow -Owner $window
+            }
+            catch {
+                Write-Warning "还原备份操作失败：$($_.Exception.Message)"
+                Show-MessageBox -Owner $window -Message "无法打开还原备份对话框：$($_.Exception.Message)" -Title '还原备份失败' -Button 'OK' -Icon 'Error' | Out-Null
+            }
+        })
+    }
 
     $closeBtn.Add_Click({
         $window.Close()
@@ -76,155 +296,247 @@
         $script:CancelRequested = $true
     })
 
-    # Implement window resize functionality
-    $resizeLeft = $window.FindName('ResizeLeft')
-    $resizeRight = $window.FindName('ResizeRight')
-    $resizeTop = $window.FindName('ResizeTop')
-    $resizeBottom = $window.FindName('ResizeBottom')
-    $resizeTopLeft = $window.FindName('ResizeTopLeft')
-    $resizeTopRight = $window.FindName('ResizeTopRight')
-    $resizeBottomLeft = $window.FindName('ResizeBottomLeft')
-    $resizeBottomRight = $window.FindName('ResizeBottomRight')
-
-    $script:resizing = $false
-    $script:resizeEdges = $null
-    $script:resizeStart = $null
-    $script:windowStart = $null
-    $script:resizeElement = $null
-
-    $resizeHandler = {
-        param($sender, $e)
-        
-        $script:resizing = $true
-        $script:resizeElement = $sender
-        $script:resizeStart = [System.Windows.Forms.Cursor]::Position
-        $script:windowStart = @{
-            Left = $window.Left
-            Top = $window.Top
-            Width = $window.ActualWidth
-            Height = $window.ActualHeight
-        }
-        
-        # Parse direction tag into edge flags for cleaner resize logic
-        $direction = $sender.Tag
-        $script:resizeEdges = @{
-            Left = $direction -match 'Left'
-            Right = $direction -match 'Right'
-            Top = $direction -match 'Top'
-            Bottom = $direction -match 'Bottom'
-        }
-        
-        $sender.CaptureMouse()
-        $e.Handled = $true
-    }
-
-    $moveHandler = {
-        param($sender, $e)
-        if (-not $script:resizing) { return }
-        
-        $current = [System.Windows.Forms.Cursor]::Position
-        $deltaX = $current.X - $script:resizeStart.X
-        $deltaY = $current.Y - $script:resizeStart.Y
-
-        # Handle horizontal resize
-        if ($script:resizeEdges.Left) {
-            $newWidth = [Math]::Max($window.MinWidth, $script:windowStart.Width - $deltaX)
-            if ($newWidth -ne $window.Width) {
-                $window.Left = $script:windowStart.Left + ($script:windowStart.Width - $newWidth)
-                $window.Width = $newWidth
-            }
-        }
-        elseif ($script:resizeEdges.Right) {
-            $window.Width = [Math]::Max($window.MinWidth, $script:windowStart.Width + $deltaX)
-        }
-
-        # Handle vertical resize
-        if ($script:resizeEdges.Top) {
-            $newHeight = [Math]::Max($window.MinHeight, $script:windowStart.Height - $deltaY)
-            if ($newHeight -ne $window.Height) {
-                $window.Top = $script:windowStart.Top + ($script:windowStart.Height - $newHeight)
-                $window.Height = $newHeight
-            }
-        }
-        elseif ($script:resizeEdges.Bottom) {
-            $window.Height = [Math]::Max($window.MinHeight, $script:windowStart.Height + $deltaY)
-        }
-        
-        $e.Handled = $true
-    }
-
-    $releaseHandler = {
-        param($sender, $e)
-        if ($script:resizing -and $script:resizeElement) {
-            $script:resizing = $false
-            $script:resizeEdges = $null
-            $script:resizeElement.ReleaseMouseCapture()
-            $script:resizeElement = $null
-            $e.Handled = $true
-        }
-    }
-
-    # Set tags and add event handlers for resize borders
-    $resizeLeft.Tag = 'Left'
-    $resizeLeft.Add_PreviewMouseLeftButtonDown($resizeHandler)
-    $resizeLeft.Add_MouseMove($moveHandler)
-    $resizeLeft.Add_MouseLeftButtonUp($releaseHandler)
-    
-    $resizeRight.Tag = 'Right'
-    $resizeRight.Add_PreviewMouseLeftButtonDown($resizeHandler)
-    $resizeRight.Add_MouseMove($moveHandler)
-    $resizeRight.Add_MouseLeftButtonUp($releaseHandler)
-    
-    $resizeTop.Tag = 'Top'
-    $resizeTop.Add_PreviewMouseLeftButtonDown($resizeHandler)
-    $resizeTop.Add_MouseMove($moveHandler)
-    $resizeTop.Add_MouseLeftButtonUp($releaseHandler)
-    
-    $resizeBottom.Tag = 'Bottom'
-    $resizeBottom.Add_PreviewMouseLeftButtonDown($resizeHandler)
-    $resizeBottom.Add_MouseMove($moveHandler)
-    $resizeBottom.Add_MouseLeftButtonUp($releaseHandler)
-    
-    $resizeTopLeft.Tag = 'TopLeft'
-    $resizeTopLeft.Add_PreviewMouseLeftButtonDown($resizeHandler)
-    $resizeTopLeft.Add_MouseMove($moveHandler)
-    $resizeTopLeft.Add_MouseLeftButtonUp($releaseHandler)
-    
-    $resizeTopRight.Tag = 'TopRight'
-    $resizeTopRight.Add_PreviewMouseLeftButtonDown($resizeHandler)
-    $resizeTopRight.Add_MouseMove($moveHandler)
-    $resizeTopRight.Add_MouseLeftButtonUp($releaseHandler)
-    
-    $resizeBottomLeft.Tag = 'BottomLeft'
-    $resizeBottomLeft.Add_PreviewMouseLeftButtonDown($resizeHandler)
-    $resizeBottomLeft.Add_MouseMove($moveHandler)
-    $resizeBottomLeft.Add_MouseLeftButtonUp($releaseHandler)
-    
-    $resizeBottomRight.Tag = 'BottomRight'
-    $resizeBottomRight.Add_PreviewMouseLeftButtonDown($resizeHandler)
-    $resizeBottomRight.Add_MouseMove($moveHandler)
-    $resizeBottomRight.Add_MouseLeftButtonUp($releaseHandler)
-
     # Integrated App Selection UI
     $appsPanel = $window.FindName('AppSelectionPanel')
     $onlyInstalledAppsBox = $window.FindName('OnlyInstalledAppsBox')
     $loadingAppsIndicator = $window.FindName('LoadingAppsIndicator')
     $appSelectionStatus = $window.FindName('AppSelectionStatus')
-    $defaultAppsBtn = $window.FindName('DefaultAppsBtn')
+    $headerNameBtn = $window.FindName('HeaderNameBtn')
+    $headerDescriptionBtn = $window.FindName('HeaderDescriptionBtn')
+    $headerAppIdBtn = $window.FindName('HeaderAppIdBtn')
+    $sortArrowName = $window.FindName('SortArrowName')
+    $sortArrowDescription = $window.FindName('SortArrowDescription')
+    $sortArrowAppId = $window.FindName('SortArrowAppId')
+    $presetsBtn = $window.FindName('PresetsBtn')
+    $presetsPopup = $window.FindName('PresetsPopup')
+    $presetDefaultApps = $window.FindName('PresetDefaultApps')
+    $presetLastUsed = $window.FindName('PresetLastUsed')
+    $jsonPresetsPanel = $window.FindName('JsonPresetsPanel')
+    $presetsArrow = $window.FindName('PresetsArrow')
     $clearAppSelectionBtn = $window.FindName('ClearAppSelectionBtn')
+    $tweaksPresetsBtn = $window.FindName('TweaksPresetsBtn')
+    $tweaksPresetsPopup = $window.FindName('TweaksPresetsPopup')
+    $presetDefaultTweaksBtn = $window.FindName('PresetDefaultTweaksBtn')
+    $presetLastUsedTweaksBtn = $window.FindName('PresetLastUsedTweaksBtn')
+    $presetPrivacyTweaksBtn = $window.FindName('PresetPrivacyTweaksBtn')
+    $presetAITweaksBtn = $window.FindName('PresetAITweaksBtn')
+    $tweaksPresetsArrow = $window.FindName('TweaksPresetsArrow')
+
+    function AttachTriStateClickBehavior {
+        param([System.Windows.Controls.CheckBox]$checkBox)
+
+        if (-not $checkBox -or -not $checkBox.IsThreeState) { return }
+
+        if (-not $checkBox.PSObject.Properties['WasIndeterminateBeforeClick']) {
+            Add-Member -InputObject $checkBox -MemberType NoteProperty -Name 'WasIndeterminateBeforeClick' -Value $false
+        }
+
+        $checkBox.Add_PreviewMouseLeftButtonDown({
+            $this.WasIndeterminateBeforeClick = ($this.IsChecked -eq [System.Nullable[bool]]$null)
+        })
+    }
+
+    function NormalizeCheckboxState {
+        param([System.Windows.Controls.CheckBox]$checkBox)
+
+        if ($checkBox.PSObject.Properties['WasIndeterminateBeforeClick'] -and $checkBox.WasIndeterminateBeforeClick) {
+            # WPF toggles null -> false before Click handlers fire; restore desired mixed -> checked behavior.
+            $checkBox.WasIndeterminateBeforeClick = $false
+            $checkBox.IsChecked = $true
+            return $true
+        }
+
+        return ($checkBox.IsChecked -eq $true)
+    }
+
+    function SetTriStatePresetCheckBoxState {
+        param(
+            [System.Windows.Controls.CheckBox]$CheckBox,
+            [int]$Total,
+            [int]$Selected
+        )
+
+        if (-not $CheckBox) { return }
+
+        if ($Total -eq 0) {
+            $CheckBox.IsEnabled = $false
+            $CheckBox.IsChecked = $false
+            return
+        }
+
+        $CheckBox.IsEnabled = $true
+        if ($Selected -eq 0) {
+            $CheckBox.IsChecked = $false
+        }
+        elseif ($Selected -eq $Total) {
+            $CheckBox.IsChecked = $true
+        }
+        else {
+            $CheckBox.IsChecked = [System.Nullable[bool]]$null
+        }
+    }
+
+    function ClearTweakSelections {
+        if (-not $script:UiControlMappings) { return }
+
+        foreach ($controlName in $script:UiControlMappings.Keys) {
+            $control = $window.FindName($controlName)
+            if ($control -is [System.Windows.Controls.CheckBox]) {
+                $control.IsChecked = $false
+            }
+            elseif ($control -is [System.Windows.Controls.ComboBox]) {
+                $control.SelectedIndex = 0
+            }
+        }
+    }
+
+    function AnimateDropdownArrow {
+        param(
+            [System.Windows.Controls.TextBlock]$arrow,
+            [double]$angle
+        )
+
+        if (-not $arrow) { return }
+
+        $animation = New-Object System.Windows.Media.Animation.DoubleAnimation
+        $animation.To = $angle
+        $animation.Duration = [System.Windows.Duration]::new([System.TimeSpan]::FromMilliseconds(200))
+
+        $ease = New-Object System.Windows.Media.Animation.CubicEase
+        $ease.EasingMode = 'EaseOut'
+        $animation.EasingFunction = $ease
+
+        $arrow.RenderTransform.BeginAnimation([System.Windows.Media.RotateTransform]::AngleProperty, $animation)
+    }
+
+    # Load JSON-defined presets and build dynamic preset checkboxes
+    $script:JsonPresetCheckboxes = @()
+    foreach ($preset in (LoadAppPresetsFromJson)) {
+        $checkbox = New-Object System.Windows.Controls.CheckBox
+        $checkbox.Content = $preset.Name
+        $checkbox.IsThreeState = $true
+        $checkbox.Style = $window.Resources['PresetCheckBoxStyle']
+        $checkbox.ToolTip = "选择 $($preset.Name)"
+        $checkbox.SetValue([System.Windows.Automation.AutomationProperties]::NameProperty, $preset.Name)
+        AttachTriStateClickBehavior -checkBox $checkbox
+        Add-Member -InputObject $checkbox -MemberType NoteProperty -Name 'PresetAppIds' -Value $preset.AppIds
+        $jsonPresetsPanel.Children.Add($checkbox) | Out-Null
+        $script:JsonPresetCheckboxes += $checkbox
+
+        $checkbox.Add_Click({
+            if ($script:UpdatingPresets) { return }
+            $presetIds = $this.PresetAppIds
+            $check = NormalizeCheckboxState -checkBox $this
+            ApplyPresetToApps -MatchFilter { param($c) (@($c.AppIds) | Where-Object { $presetIds -contains $_ }).Count -gt 0 }.GetNewClosure() -Check $check
+        })
+    }
     
     # Track the last selected checkbox for shift-click range selection
     $script:MainWindowLastSelectedCheckbox = $null
     
-    # Track current app loading operation to prevent race conditions
-    $script:CurrentAppLoadTimer = $null
-    $script:CurrentAppLoadJob = $null
-    $script:CurrentAppLoadJobStartTime = $null
+    # Guard flag: true while a load is in progress; prevents concurrent loads
+    $script:IsLoadingApps = $false
+    # Flag set when Default Mode is clicked before apps have finished loading
+    $script:PendingDefaultMode = $false
+    # Holds apps data preloaded before ShowDialog() so the first load skips the background job
+    $script:PreloadedAppData = $null
+
+    # Prevent app import until the apps list has finished initial population.
+    if ($importConfigBtn) {
+        $importConfigBtn.IsEnabled = $false
+    }
     
     # Set script-level variable for GUI window reference
     $script:GuiWindow = $window
 
-    # Updates app selection status text in the App Selection tab
+    # Guard flag to prevent preset handlers from firing when we update their state programmatically
+    $script:UpdatingPresets = $false
+    $script:UpdatingTweakPresets = $false
+
+    # Sort state for the app table
+    $script:SortColumn = 'Name'
+    $script:SortAscending = $true
+
+    function UpdateSortArrows {
+        $ease = New-Object System.Windows.Media.Animation.CubicEase
+        $ease.EasingMode = 'EaseOut'
+        $arrows = @{
+            'Name'        = $sortArrowName
+            'Description' = $sortArrowDescription
+            'AppId'       = $sortArrowAppId
+        }
+        foreach ($col in $arrows.Keys) {
+            $tb = $arrows[$col]
+            # Active column: full opacity, rotate to indicate direction (0 = up/asc, 180 = down/desc)
+            # Inactive columns: dim, reset to 0
+            if ($col -eq $script:SortColumn) {
+                $targetAngle = if ($script:SortAscending) { 0 } else { 180 }
+                $tb.Opacity = 1.0
+            } else {
+                $targetAngle = 0
+                $tb.Opacity = 0.3
+            }
+            $anim = New-Object System.Windows.Media.Animation.DoubleAnimation
+            $anim.To = $targetAngle
+            $anim.Duration = [System.Windows.Duration]::new([System.TimeSpan]::FromMilliseconds(200))
+            $anim.EasingFunction = $ease
+            $tb.RenderTransform.BeginAnimation([System.Windows.Media.RotateTransform]::AngleProperty, $anim)
+        }
+    }
+
+    # Rebuilds $script:AppSearchMatches by scanning appsPanel children in their current order,
+    # collecting any that are still highlighted. Preserves the active match across reorderings.
+    function RebuildAppSearchIndex {
+        param($activeMatch = $null)
+        $newMatches = @()
+        $newActiveIndex = -1
+        $i = 0
+        foreach ($child in $appsPanel.Children) {
+            if ($child -is [System.Windows.Controls.CheckBox] -and $child.Background -ne [System.Windows.Media.Brushes]::Transparent) {
+                $newMatches += $child
+                if ($null -ne $activeMatch -and [System.Object]::ReferenceEquals($child, $activeMatch)) {
+                    $newActiveIndex = $i
+                }
+                $i++
+            }
+        }
+        $script:AppSearchMatches = $newMatches
+        $script:AppSearchMatchIndex = if ($newActiveIndex -ge 0) { $newActiveIndex } elseif ($newMatches.Count -gt 0) { 0 } else { -1 }
+    }
+
+    function SortApps {
+        $children = @($appsPanel.Children)
+        $key = switch ($script:SortColumn) {
+            'Name'        { { $_.AppName } }
+            'Description' { { $_.AppDescription } }
+            'AppId'       { { $_.AppIdDisplay } }
+        }
+        $sorted = $children | Sort-Object $key -Descending:(-not $script:SortAscending)
+        $appsPanel.Children.Clear()
+        foreach ($checkbox in $sorted) {
+            $appsPanel.Children.Add($checkbox) | Out-Null
+        }
+        UpdateSortArrows
+
+        # Rebuild search match list in new sorted order so keyboard navigation stays correct
+        if ($script:AppSearchMatches.Count -gt 0) {
+            $activeMatch = if ($script:AppSearchMatchIndex -ge 0 -and $script:AppSearchMatchIndex -lt $script:AppSearchMatches.Count) {
+                $script:AppSearchMatches[$script:AppSearchMatchIndex]
+            } else { $null }
+            RebuildAppSearchIndex -activeMatch $activeMatch
+        }
+    }
+
+    function SetSortColumn($column) {
+        if ($script:SortColumn -eq $column) {
+            $script:SortAscending = -not $script:SortAscending
+        } else {
+            $script:SortColumn = $column
+            $script:SortAscending = $true
+        }
+        SortApps
+    }
+
     function UpdateAppSelectionStatus {
         $selectedCount = 0
         foreach ($child in $appsPanel.Children) {
@@ -232,7 +544,74 @@
                 $selectedCount++
             }
         }
-        $appSelectionStatus.Text = "$selectedCount app(s) selected for removal"
+        $appSelectionStatus.Text = "已选择 $selectedCount 个应用进行卸载"
+
+        if ($appRemovalScopeCombo -and $appRemovalScopeSection -and $appRemovalScopeDescription) {
+            if ($selectedCount -gt 0) {
+                if ($userSelectionCombo.SelectedIndex -ne 2) {
+                    $appRemovalScopeCombo.IsEnabled = $true
+                }
+                UpdateAppRemovalScopeDescription
+            }
+            else {
+                $appRemovalScopeCombo.IsEnabled = $false
+                $appRemovalScopeDescription.Text = "未选择任何应用进行卸载。"
+            }
+        }
+    }
+
+    # Applies a preset by checking/unchecking apps that match the given filter
+    # When -Exclusive is set, all apps are unchecked first so only matching apps end up selected
+    function ApplyPresetToApps {
+        param ( 
+            [scriptblock]$MatchFilter,
+            [bool]$Check,
+            [switch]$Exclusive
+        )
+        foreach ($child in $appsPanel.Children) {
+            if ($child -is [System.Windows.Controls.CheckBox]) {
+                if ($Exclusive) {
+                    $child.IsChecked = (& $MatchFilter $child)
+                } elseif (& $MatchFilter $child) {
+                    $child.IsChecked = $Check
+                }
+            }
+        }
+        UpdatePresetStates
+    }
+
+    # Update preset checkboxes to reflect checked/indeterminate/unchecked state
+    function UpdatePresetStates {
+        $script:UpdatingPresets = $true
+        try {
+            # Helper: count matching and checked apps, set checkbox state
+            function SetPresetState($checkbox, [scriptblock]$MatchFilter) {
+                $total = 0; $checked = 0
+                foreach ($child in $appsPanel.Children) {
+                    if ($child -is [System.Windows.Controls.CheckBox]) {
+                        if (& $MatchFilter $child) {
+                            $total++
+                            if ($child.IsChecked) { $checked++ }
+                        }
+                    }
+                }
+                SetTriStatePresetCheckBoxState -CheckBox $checkbox -Total $total -Selected $checked
+            }
+
+            SetPresetState $presetDefaultApps { param($c) $c.SelectedByDefault -eq $true }
+            foreach ($jsonCb in $script:JsonPresetCheckboxes) {
+                $localIds = $jsonCb.PresetAppIds
+                SetPresetState $jsonCb { param($c) (@($c.AppIds) | Where-Object { $localIds -contains $_ }).Count -gt 0 }.GetNewClosure()
+            }
+
+            # Last used preset: only update if it's visible (has saved apps)
+            if ($presetLastUsed.Visibility -ne 'Collapsed' -and $script:SavedAppIds) {
+                SetPresetState $presetLastUsed { param($c) (@($c.AppIds) | Where-Object { $script:SavedAppIds -contains $_ }).Count -gt 0 }
+            }
+        }
+        finally {
+            $script:UpdatingPresets = $false
+        }
     }
 
     # Dynamically builds Tweaks UI from Features.json
@@ -240,7 +619,7 @@
         $featuresJson = LoadJsonFile -filePath $script:FeaturesFilePath -expectedVersion "1.0"
 
         if (-not $featuresJson) {
-            Show-MessageBox -Message "Unable to load Features.json file!" -Title "Error" -Button 'OK' -Icon 'Error' | Out-Null
+            Show-MessageBox -Message "无法加载 Features.json 文件！" -Title "错误" -Button 'OK' -Icon 'Error' | Out-Null
             Exit
         }
 
@@ -257,6 +636,8 @@
 
         $script:UiControlMappings = @{}
         $script:CategoryCardMap = @{}
+        $script:TweaksCompactMode = $null
+        $script:TweaksCardsMovedFromCol2 = @()
 
         function CreateLabeledCombo($parent, $labelText, $comboName, $items) {
             # If only 2 items (No Change + one option), use a checkbox instead
@@ -309,7 +690,7 @@
             $combo = New-Object System.Windows.Controls.ComboBox
             $combo.Name = $comboName
             $combo.SetValue([System.Windows.Automation.AutomationProperties]::NameProperty, $labelText)
-            foreach ($it in $items) { $cbItem = New-Object System.Windows.Controls.ComboBoxItem; $cbItem.Content = $it; $combo.Items.Add($cbItem) | Out-Null }
+            foreach ($item in $items) { $comboItem = New-Object System.Windows.Controls.ComboBoxItem; $comboItem.Content = $item; $combo.Items.Add($comboItem) | Out-Null }
             $combo.SelectedIndex = 0
             $parent.Children.Add($combo) | Out-Null
             
@@ -377,12 +758,12 @@
 
             $helpBtn = New-Object System.Windows.Controls.Button
             $helpBtn.Content = $helpIcon
-            $helpBtn.ToolTip = "Open wiki for more info on '$categoryName' tweaks"
+            $helpBtn.ToolTip = "打开 Wiki 查看 ""$categoryName"" 调整项的更多信息"
             $helpBtn.Tag = (GetWikiUrlForCategory -category $categoryName)
             $helpBtn.Style = $window.Resources['CategoryHelpLinkButtonStyle']
             $helpBtn.Add_Click({
-                param($sender, $e)
-                if ($sender.Tag) { Start-Process $sender.Tag }
+                param($button, $e)
+                if ($button.Tag) { Start-Process $button.Tag }
             })
             $headerRow.Children.Add($helpBtn) | Out-Null
 
@@ -478,7 +859,7 @@
             foreach ($item in $sortedItems) {
                 if ($item.Type -eq 'group') {
                     $group = $item.Data
-                    $items = @('No Change') + ($group.Values | ForEach-Object { $_.Label })
+                    $items = @('不更改') + ($group.Values | ForEach-Object { $_.Label })
                     $comboName = 'Group_{0}Combo' -f $group.GroupId
                     $combo = CreateLabeledCombo -parent $panel -labelText $group.Label -comboName $comboName -items $items
                     # attach tooltip from UiGroups if present
@@ -492,15 +873,15 @@
                         try { $lblBorderObj = $window.FindName("$comboName`_LabelBorder") } catch {}
                         if ($lblBorderObj) { $lblBorderObj.ToolTip = $tipBlock }
                     }
-                    $script:UiControlMappings[$comboName] = @{ Type='group'; Values = $group.Values; Label = $group.Label }
+                    $script:UiControlMappings[$comboName] = @{ Type='group'; Values = $group.Values; Label = $group.Label; Category = $categoryName }
                 }
                 elseif ($item.Type -eq 'feature') {
                     $feature = $item.Data
-                    $opt = 'Apply'
-                    if ($feature.FeatureId -match '^Disable') { $opt = 'Disable' } elseif ($feature.FeatureId -match '^Enable') { $opt = 'Enable' }
-                    $items = @('No Change', $opt)
+                    $opt = '应用'
+                    if ($feature.FeatureId -match '^Disable') { $opt = '禁用' } elseif ($feature.FeatureId -match '^Enable') { $opt = '启用' }
+                    $items = @('不更改', $opt)
                     $comboName = ("Feature_{0}_Combo" -f $feature.FeatureId) -replace '[^a-zA-Z0-9_]',''
-                    $combo = CreateLabeledCombo -parent $panel -labelText ($feature.Action + ' ' + $feature.Label) -comboName $comboName -items $items
+                    $combo = CreateLabeledCombo -parent $panel -labelText $feature.Label -comboName $comboName -items $items
                     # attach tooltip from Features.json if present
                     if ($feature.ToolTip) {
                         $tipBlock = New-Object System.Windows.Controls.TextBlock
@@ -512,188 +893,282 @@
                         try { $lblBorderObj = $window.FindName("$comboName`_LabelBorder") } catch {}
                         if ($lblBorderObj) { $lblBorderObj.ToolTip = $tipBlock }
                     }
-                    $script:UiControlMappings[$comboName] = @{ Type='feature'; FeatureId = $feature.FeatureId; Action = $feature.Action }
+                    $script:UiControlMappings[$comboName] = @{ Type='feature'; FeatureId = $feature.FeatureId; Label = $feature.Label; Category = $categoryName }
                 }
             }
         }
+
+        # Build a feature-label lookup so GenerateOverview can resolve feature IDs without reloading JSON
+        $script:FeatureLabelLookup = @{}
+        foreach ($f in $featuresJson.Features) {
+            $script:FeatureLabelLookup[$f.FeatureId] = $f.Label
+        }
     }
 
-    # Helper function to complete app loading with the WinGet list
+    # Helper function to load apps and populate the app list panel
     function script:LoadAppsWithList($listOfApps) {
-        $appsToAdd = LoadAppsDetailsFromJson -OnlyInstalled:$onlyInstalledAppsBox.IsChecked -InstalledList $listOfApps -InitialCheckedFromJson:$false
-
-        # Reset the last selected checkbox when loading a new list
         $script:MainWindowLastSelectedCheckbox = $null
 
-        # Sort apps alphabetically and add to panel
-        $appsToAdd | Sort-Object -Property FriendlyName | ForEach-Object {
-            $checkbox = New-Object System.Windows.Controls.CheckBox
-            $checkbox.SetValue([System.Windows.Automation.AutomationProperties]::NameProperty, $_.FriendlyName)
-            $checkbox.Tag = $_.AppId
-            $checkbox.IsChecked = $_.IsChecked
-            $checkbox.Style = $window.Resources["AppsPanelCheckBoxStyle"]
+        $loaderScriptPath = $script:LoadAppsDetailsScriptPath
+        $appsFilePath  = $script:AppsListFilePath
+        $onlyInstalled = [bool]$onlyInstalledAppsBox.IsChecked
 
-            # Build table row content: App Name | Description | App ID
-            $row = New-Object System.Windows.Controls.Grid
-            $c0 = New-Object System.Windows.Controls.ColumnDefinition; $c0.Width = [System.Windows.GridLength]::new(160)
-            $c1 = New-Object System.Windows.Controls.ColumnDefinition; $c1.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
-            $c2 = New-Object System.Windows.Controls.ColumnDefinition; $c2.Width = [System.Windows.GridLength]::new(286)
-            $row.ColumnDefinitions.Add($c0); $row.ColumnDefinitions.Add($c1); $row.ColumnDefinitions.Add($c2)
-
-            $tbName = New-Object System.Windows.Controls.TextBlock
-            $tbName.Text = $_.FriendlyName
-            $tbName.Style = $window.Resources["AppNameTextStyle"]
-            [System.Windows.Controls.Grid]::SetColumn($tbName, 0)
-
-            $tbDesc = New-Object System.Windows.Controls.TextBlock
-            $tbDesc.Text = $_.Description
-            $tbDesc.Style = $window.Resources["AppDescTextStyle"]
-            $tbDesc.ToolTip = $_.Description
-            [System.Windows.Controls.Grid]::SetColumn($tbDesc, 1)
-
-            $tbId = New-Object System.Windows.Controls.TextBlock
-            $tbId.Text = $_.AppId
-            $tbId.Style = $window.Resources["AppIdTextStyle"]
-            $tbId.ToolTip = $_.AppId
-            [System.Windows.Controls.Grid]::SetColumn($tbId, 2)
-
-            $row.Children.Add($tbName) | Out-Null
-            $row.Children.Add($tbDesc) | Out-Null
-            $row.Children.Add($tbId) | Out-Null
-            $checkbox.Content = $row
-
-            # Store metadata in checkbox for later use
-            Add-Member -InputObject $checkbox -MemberType NoteProperty -Name "AppName" -Value $_.FriendlyName
-            Add-Member -InputObject $checkbox -MemberType NoteProperty -Name "AppDescription" -Value $_.Description
-            Add-Member -InputObject $checkbox -MemberType NoteProperty -Name "SelectedByDefault" -Value $_.SelectedByDefault
-            
-            # Add event handler to update status
-            $checkbox.Add_Checked({ UpdateAppSelectionStatus })
-            $checkbox.Add_Unchecked({ UpdateAppSelectionStatus })
-            
-            # Attach shift-click behavior for range selection
-            AttachShiftClickBehavior -checkbox $checkbox -appsPanel $appsPanel -lastSelectedCheckboxRef ([ref]$script:MainWindowLastSelectedCheckbox) -updateStatusCallback { UpdateAppSelectionStatus }
-            
-            $appsPanel.Children.Add($checkbox) | Out-Null
+        # Use preloaded data if available; otherwise load in background job
+        if (-not $onlyInstalled -and $script:PreloadedAppData) {
+            $rawAppData = $script:PreloadedAppData
+            $script:PreloadedAppData = $null
+        } else {
+            # Load apps details in a background job to keep the UI responsive
+            $rawAppData = Invoke-NonBlocking -ScriptBlock {
+                param($loaderScript, $appsListFilePath, $installedList, $onlyInstalled)
+                $script:AppsListFilePath = $appsListFilePath
+                . $loaderScript
+                LoadAppsDetailsFromJson -OnlyInstalled:$onlyInstalled -InstalledList $installedList -InitialCheckedFromJson:$false
+            } -ArgumentList $loaderScriptPath, $appsFilePath, $listOfApps, $onlyInstalled
         }
 
-        # Hide loading indicator and navigation blocker, update status
+        $appsToAdd = @($rawAppData | Where-Object { $_ -and ($_.AppId -or $_.FriendlyName) } | Sort-Object -Property FriendlyName)
+
         $loadingAppsIndicator.Visibility = 'Collapsed'
 
+        if ($appsToAdd.Count -eq 0) {
+            $window.FindName('DeploymentApplyBtn').IsEnabled = $true
+            if ($importConfigBtn) {
+                $importConfigBtn.IsEnabled = $true
+            }
+            return
+        }
+
+        $brushSafe    = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#4CAF50')
+        $brushUnsafe  = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#F44336')
+        $brushDefault = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#FFC107')
+        $brushSafe.Freeze(); $brushUnsafe.Freeze(); $brushDefault.Freeze()
+
+        # Create WPF controls; pump the Dispatcher every batch so the spinner keeps animating.
+        $batchSize = 20
+        for ($i = 0; $i -lt $appsToAdd.Count; $i++) {
+            $app = $appsToAdd[$i]
+
+            $checkbox = New-Object System.Windows.Controls.CheckBox
+            $automationName = if ($app.FriendlyName) { $app.FriendlyName } elseif ($app.AppIdDisplay) { $app.AppIdDisplay } else { $null }
+            if ($automationName) { $checkbox.SetValue([System.Windows.Automation.AutomationProperties]::NameProperty, $automationName) }
+            $checkbox.Tag       = $app.AppIdDisplay
+            $checkbox.IsChecked = $app.IsChecked
+            $checkbox.Style     = $window.Resources['AppsPanelCheckBoxStyle']
+
+            # Build table row: Recommendation dot | Name | Description | App ID
+            $row = New-Object System.Windows.Controls.Grid
+            $row.Style = $window.Resources['AppTableRowStyle']
+            $c0 = New-Object System.Windows.Controls.ColumnDefinition; $c0.Width = $window.Resources['AppTableDotColWidth']
+            $c1 = New-Object System.Windows.Controls.ColumnDefinition; $c1.Width = $window.Resources['AppTableNameColWidth']
+            $c2 = New-Object System.Windows.Controls.ColumnDefinition; $c2.Width = $window.Resources['AppTableDescColWidth']
+            $c3 = New-Object System.Windows.Controls.ColumnDefinition; $c3.Width = $window.Resources['AppTableIdColWidth']
+            $row.ColumnDefinitions.Add($c0); $row.ColumnDefinitions.Add($c1)
+            $row.ColumnDefinitions.Add($c2); $row.ColumnDefinitions.Add($c3)
+
+            $dot = New-Object System.Windows.Shapes.Ellipse
+            $dot.Style = $window.Resources['AppRecommendationDotStyle']
+            $dot.Fill  = switch ($app.Recommendation) { 'safe' { $brushSafe } 'unsafe' { $brushUnsafe } default { $brushDefault } }
+            $dot.ToolTip = switch ($app.Recommendation) {
+                'safe'   { '[推荐] 大多数用户都可安全卸载' }
+                'unsafe' { '[不推荐] 仅在了解后果时再卸载' }
+                default  { '[可选] 如不需要此应用，可以卸载' }
+            }
+            [System.Windows.Controls.Grid]::SetColumn($dot, 0)
+
+            $tbName = New-Object System.Windows.Controls.TextBlock
+            $tbName.Text  = $app.FriendlyName
+            $tbName.Style = $window.Resources['AppNameTextStyle']
+            [System.Windows.Controls.Grid]::SetColumn($tbName, 1)
+
+            $tbDesc = New-Object System.Windows.Controls.TextBlock
+            $tbDesc.Text    = $app.Description
+            $tbDesc.Style   = $window.Resources['AppDescTextStyle']
+            $tbDesc.ToolTip = $app.Description
+            [System.Windows.Controls.Grid]::SetColumn($tbDesc, 2)
+
+            $tbId = New-Object System.Windows.Controls.TextBlock
+            $tbId.Text = $app.AppIdDisplay
+            $tbId.Style = $window.Resources["AppIdTextStyle"]
+            $tbId.ToolTip = $app.AppIdDisplay
+            [System.Windows.Controls.Grid]::SetColumn($tbId, 3)
+
+            $row.Children.Add($dot)    | Out-Null
+            $row.Children.Add($tbName) | Out-Null
+            $row.Children.Add($tbDesc) | Out-Null
+            $row.Children.Add($tbId)   | Out-Null
+            $checkbox.Content = $row
+
+            Add-Member -InputObject $checkbox -MemberType NoteProperty -Name 'AppName'          -Value $app.FriendlyName
+            Add-Member -InputObject $checkbox -MemberType NoteProperty -Name 'AppDescription'   -Value $app.Description
+            Add-Member -InputObject $checkbox -MemberType NoteProperty -Name 'SelectedByDefault' -Value $app.SelectedByDefault
+            Add-Member -InputObject $checkbox -MemberType NoteProperty -Name 'AppIds' -Value @($app.AppId)
+            Add-Member -InputObject $checkbox -MemberType NoteProperty -Name 'AppIdDisplay' -Value $app.AppIdDisplay
+
+            $checkbox.Add_Checked({ UpdateAppSelectionStatus })
+            $checkbox.Add_Unchecked({ UpdateAppSelectionStatus })
+            AttachShiftClickBehavior -checkbox $checkbox -appsPanel $appsPanel `
+                -lastSelectedCheckboxRef ([ref]$script:MainWindowLastSelectedCheckbox) `
+                -updateStatusCallback { UpdateAppSelectionStatus }
+
+            $appsPanel.Children.Add($checkbox) | Out-Null
+
+            if (($i + 1) % $batchSize -eq 0) { DoEvents }
+        }
+
+        SortApps
+
+        # If Default Mode was clicked while apps were still loading, apply defaults now
+        if ($script:PendingDefaultMode) {
+            $script:PendingDefaultMode = $false
+            ApplyPresetToApps -MatchFilter { param($c) $c.SelectedByDefault -eq $true } -Exclusive
+        }
+        
         UpdateAppSelectionStatus
+
+        # Re-enable Apply button now that the full, correctly-checked app list is ready
+        $window.FindName('DeploymentApplyBtn').IsEnabled = $true
+        if ($importConfigBtn) {
+            $importConfigBtn.IsEnabled = $true
+        }
     }
 
     # Loads apps into the UI
     function LoadAppsIntoMainUI {
-        # Cancel any existing load operation to prevent race conditions
-        if ($script:CurrentAppLoadTimer -and $script:CurrentAppLoadTimer.IsEnabled) {
-            $script:CurrentAppLoadTimer.Stop()
+        # Prevent concurrent loads
+        if ($script:IsLoadingApps) { return }
+        $script:IsLoadingApps = $true
+
+        if ($importConfigBtn) {
+            $importConfigBtn.IsEnabled = $false
         }
-        if ($script:CurrentAppLoadJob) {
-            Remove-Job -Job $script:CurrentAppLoadJob -Force -ErrorAction SilentlyContinue
-        }
-        $script:CurrentAppLoadTimer = $null
-        $script:CurrentAppLoadJob = $null
-        $script:CurrentAppLoadJobStartTime = $null
-        
-        # Show loading indicator and navigation blocker, clear existing apps immediately
+
+        # Show loading indicator and clear existing apps
         $loadingAppsIndicator.Visibility = 'Visible'
         $appsPanel.Children.Clear()
-        
+
+        # Disable Apply button while apps are loading so it can't be clicked with a partial list
+        $window.FindName('DeploymentApplyBtn').IsEnabled = $false
+
         # Update navigation buttons to disable Next/Previous
         UpdateNavigationButtons
-        
-        # Force UI to update and render all changes (loading indicator, blocker, disabled buttons)
+
+        # Force a render so the loading indicator is visible, then schedule the
+        # actual loading at Background priority so this call returns immediately.
+        # This is critical when called from Add_Loaded: the window must finish
+        # its initialization before we start a nested message pump via DoEvents.
         $window.Dispatcher.Invoke([System.Windows.Threading.DispatcherPriority]::Render, [action]{})
-        
-        # Schedule the actual loading work to run after UI has updated
         $window.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, [action]{
-            $listOfApps = ""
+            try {
+                $listOfApps = ""
 
-            if ($onlyInstalledAppsBox.IsChecked -and ($script:WingetInstalled -eq $true)) {
-                # Start job to get list of installed apps via WinGet (async helper)
-                $asyncJob = GetInstalledAppsViaWinget -Async
-                $script:CurrentAppLoadJob = $asyncJob.Job
-                $script:CurrentAppLoadJobStartTime = $asyncJob.StartTime
-                
-                # Create timer to poll job status without blocking UI
-                $script:CurrentAppLoadTimer = New-Object System.Windows.Threading.DispatcherTimer
-                $script:CurrentAppLoadTimer.Interval = [TimeSpan]::FromMilliseconds(100)
-                
-                $script:CurrentAppLoadTimer.Add_Tick({
-                    # Check if this timer was cancelled (another load started)
-                    if (-not $script:CurrentAppLoadJob -or -not $script:CurrentAppLoadTimer -or -not $script:CurrentAppLoadJobStartTime) {
-                        if ($script:CurrentAppLoadTimer) { $script:CurrentAppLoadTimer.Stop() }
-                        return
-                    }
-                    
-                    $elapsed = (Get-Date) - $script:CurrentAppLoadJobStartTime
-                    
-                    # Check if job is complete or timed out (10 seconds)
-                    if ($script:CurrentAppLoadJob.State -eq 'Completed') {
-                        $script:CurrentAppLoadTimer.Stop()
-                        $listOfApps = Receive-Job -Job $script:CurrentAppLoadJob
-                        Remove-Job -Job $script:CurrentAppLoadJob -ErrorAction SilentlyContinue
-                        $script:CurrentAppLoadJob = $null
-                        $script:CurrentAppLoadTimer = $null
-                        $script:CurrentAppLoadJobStartTime = $null
-                        
-                        # Continue with loading apps
-                        LoadAppsWithList $listOfApps
-                    }
-                    elseif ($elapsed.TotalSeconds -gt 10 -or $script:CurrentAppLoadJob.State -eq 'Failed') {
-                        $script:CurrentAppLoadTimer.Stop()
-                        Remove-Job -Job $script:CurrentAppLoadJob -Force -ErrorAction SilentlyContinue
-                        $script:CurrentAppLoadJob = $null
-                        $script:CurrentAppLoadTimer = $null
-                        $script:CurrentAppLoadJobStartTime = $null
-                        
-                        # Show error that the script was unable to get list of apps from WinGet
-                        Show-MessageBox -Message 'Unable to load list of installed apps via WinGet.' -Title 'Error' -Button 'OK' -Icon 'Error' | Out-Null
+                if ($onlyInstalledAppsBox.IsChecked -and ($script:WingetInstalled -eq $true)) {
+                    $listOfApps = GetInstalledAppsViaWinget -TimeOut 10 -NonBlocking
+
+                    if ($null -eq $listOfApps) {
+                        Show-MessageBox -Message '无法通过 WinGet 加载已安装的应用列表。' -Title '错误' -Button 'OK' -Icon 'Error' | Out-Null
                         $onlyInstalledAppsBox.IsChecked = $false
-                        
-                        # Continue with loading all apps (unchecked now)
-                        LoadAppsWithList ""
                     }
-                })
-                
-                $script:CurrentAppLoadTimer.Start()
-                return  # Exit here, timer will continue the work
-            }
+                }
 
-            # If checkbox is not checked or winget not installed, load all apps immediately
-            LoadAppsWithList $listOfApps
+                LoadAppsWithList $listOfApps
+            }
+            finally {
+                $script:IsLoadingApps = $false
+            }
         }) | Out-Null
     }
 
     # Event handlers for app selection
     $onlyInstalledAppsBox.Add_Checked({
-        LoadAppsIntoMainUI 
+        LoadAppsIntoMainUI
     })
     $onlyInstalledAppsBox.Add_Unchecked({
-        LoadAppsIntoMainUI 
+        LoadAppsIntoMainUI
     })
 
-    # Quick selection buttons - only select apps actually in those categories
-    $defaultAppsBtn.Add_Click({
-        foreach ($child in $appsPanel.Children) {
-            if ($child -is [System.Windows.Controls.CheckBox]) {
-                if ($child.SelectedByDefault -eq $true) {
-                    $child.IsChecked = $true
-                } else {
-                    $child.IsChecked = $false
-                }
-            }
+    # Animate arrow when popup opens/closes, and lazily update preset states
+    $presetsPopup.Add_Opened({
+        UpdatePresetStates
+        AnimateDropdownArrow -arrow $presetsArrow -angle 180
+    })
+    $presetsPopup.Add_Closed({
+        AnimateDropdownArrow -arrow $presetsArrow -angle 0
+        $presetsBtn.IsChecked = $false
+    })
+
+    $tweaksPresetsPopup.Add_Opened({
+        UpdateTweakPresetStates
+        AnimateDropdownArrow -arrow $tweaksPresetsArrow -angle 180
+    })
+    $tweaksPresetsPopup.Add_Closed({
+        AnimateDropdownArrow -arrow $tweaksPresetsArrow -angle 0
+        $tweaksPresetsBtn.IsChecked = $false
+    })
+
+    # Close popup when clicking anywhere outside the popup or the presets button.
+    $window.Add_PreviewMouseDown({
+        $isAppPopupOpen = $presetsPopup.IsOpen
+        $isTweaksPopupOpen = $tweaksPresetsPopup.IsOpen
+        if (-not $isAppPopupOpen -and -not $isTweaksPopupOpen) { return }
+
+        if ($isAppPopupOpen -and $null -ne $presetsPopup.Child -and $presetsPopup.Child.IsMouseOver) { return }
+        if ($isTweaksPopupOpen -and $null -ne $tweaksPresetsPopup.Child -and $tweaksPresetsPopup.Child.IsMouseOver) { return }
+
+        $src = $_.OriginalSource -as [System.Windows.DependencyObject]
+        if ($null -ne $src) {
+            $inAppBtn = $presetsBtn.IsAncestorOf($src) -or [System.Object]::ReferenceEquals($presetsBtn, $src)
+            $inTweaksBtn = $tweaksPresetsBtn.IsAncestorOf($src) -or [System.Object]::ReferenceEquals($tweaksPresetsBtn, $src)
+
+            if ($isAppPopupOpen -and -not $inAppBtn) { $presetsPopup.IsOpen = $false }
+            if ($isTweaksPopupOpen -and -not $inTweaksBtn) { $tweaksPresetsPopup.IsOpen = $false }
         }
     })
 
+    # Close the preset menu when the main window loses focus (e.g., user switches to another app).
+    $window.Add_Deactivated({
+        if ($presetsPopup.IsOpen) { $presetsPopup.IsOpen = $false }
+        if ($tweaksPresetsPopup.IsOpen) { $tweaksPresetsPopup.IsOpen = $false }
+    })
+
+    # Toggle popup on button click
+    $presetsBtn.Add_Click({
+        $presetsPopup.IsOpen = -not $presetsPopup.IsOpen
+        $presetsBtn.IsChecked = $presetsPopup.IsOpen
+    })
+
+    $tweaksPresetsBtn.Add_Click({
+        $tweaksPresetsPopup.IsOpen = -not $tweaksPresetsPopup.IsOpen
+        $tweaksPresetsBtn.IsChecked = $tweaksPresetsPopup.IsOpen
+    })
+
+    foreach ($presetCheckBox in @(
+        $presetDefaultApps,
+        $presetLastUsed,
+        $presetDefaultTweaksBtn,
+        $presetLastUsedTweaksBtn,
+        $presetPrivacyTweaksBtn,
+        $presetAITweaksBtn
+    )) {
+        AttachTriStateClickBehavior -checkBox $presetCheckBox
+    }
+
+    # Preset: Default selection
+    $presetDefaultApps.Add_Click({
+        if ($script:UpdatingPresets) { return }
+        $check = NormalizeCheckboxState -checkBox $this
+        ApplyPresetToApps -MatchFilter { param($c) $c.SelectedByDefault -eq $true } -Check $check
+    })
+
+    # Clear selection button + reset all preset checkboxes
     $clearAppSelectionBtn.Add_Click({
-        foreach ($child in $appsPanel.Children) {
-            if ($child -is [System.Windows.Controls.CheckBox]) {
-                $child.IsChecked = $false
-            }
-        }
+        ApplyPresetToApps -MatchFilter { param($c) $true } -Check $false
     })
+
+    # Column header sort handlers
+    $headerNameBtn.Add_MouseLeftButtonUp({ SetSortColumn 'Name' })
+    $headerDescriptionBtn.Add_MouseLeftButtonUp({ SetSortColumn 'Description' })
+    $headerAppIdBtn.Add_MouseLeftButtonUp({ SetSortColumn 'AppId' })
 
     # Helper function to scroll to an item if it's not visible, centering it in the viewport
     function ScrollToItemIfNotVisible {
@@ -798,7 +1273,7 @@
     })
     
     $appSearchBox.Add_KeyDown({
-        param($sender, $e)
+        param($sourceControl, $e)
         if ($e.Key -eq [System.Windows.Input.Key]::Enter -and $script:AppSearchMatches.Count -gt 0) {
             # Reset background of current active match
             $script:AppSearchMatches[$script:AppSearchMatchIndex].Background = $window.Resources["SearchHighlightColor"]
@@ -823,6 +1298,52 @@
     $col0 = $window.FindName('Column0Panel')
     $col1 = $window.FindName('Column1Panel')
     $col2 = $window.FindName('Column2Panel')
+
+    function UpdateTweaksResponsiveColumns {
+        if (-not $tweaksGrid -or -not $col0 -or -not $col1 -or -not $col2) { return }
+        if ($tweaksGrid.ColumnDefinitions.Count -lt 3) { return }
+        if ($null -eq $script:TweaksCardsMovedFromCol2) { $script:TweaksCardsMovedFromCol2 = @() }
+
+        $useTwoColumns = $window.ActualWidth -lt 1200
+        if ($script:TweaksCompactMode -eq $useTwoColumns) { return }
+        $script:TweaksCompactMode = $useTwoColumns
+
+        if ($useTwoColumns) {
+            $tweaksGrid.ColumnDefinitions[0].Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+            $tweaksGrid.ColumnDefinitions[1].Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+            $tweaksGrid.ColumnDefinitions[2].Width = [System.Windows.GridLength]::new(0)
+            $col2.Visibility = 'Collapsed'
+
+            # Move third-column cards once when entering compact mode.
+            $cardsToMove = @($col2.Children) | Where-Object { $_ -is [System.Windows.UIElement] }
+            $script:TweaksCardsMovedFromCol2 = @($cardsToMove)
+            $col2.Children.Clear()
+            $targetColumns = @($col0, $col1)
+            foreach ($card in $cardsToMove) {
+                $target = $targetColumns |
+                    Sort-Object @{Expression={$_.Children.Count}; Ascending=$true}, @{Expression={$targetColumns.IndexOf($_)}; Ascending=$true} |
+                    Select-Object -First 1
+                $target.Children.Add($card) | Out-Null
+            }
+            return
+        }
+
+        $tweaksGrid.ColumnDefinitions[0].Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+        $tweaksGrid.ColumnDefinitions[1].Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+        $tweaksGrid.ColumnDefinitions[2].Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+        $col2.Visibility = 'Visible'
+
+        foreach ($card in (@($script:TweaksCardsMovedFromCol2) | Where-Object { $_ -is [System.Windows.UIElement] })) {
+            if ($col0.Children.Contains($card)) {
+                $col0.Children.Remove($card) | Out-Null
+            }
+            elseif ($col1.Children.Contains($card)) {
+                $col1.Children.Remove($card) | Out-Null
+            }
+            $col2.Children.Add($card) | Out-Null
+        }
+        $script:TweaksCardsMovedFromCol2 = @()
+    }
     
     # Monitor scrollbar visibility and adjust searchbar margin
     $tweaksScrollViewer.Add_ScrollChanged({
@@ -830,7 +1351,7 @@
             # The 17px accounts for the scrollbar width + some padding
             $tweakSearchBorder.Margin = [System.Windows.Thickness]::new(0, 0, 17, 0)
         } else {
-            $tweakSearchBorder.Margin = [System.Windows.Thickness]::new(0, 0, 0, 0)
+            $tweakSearchBorder.Margin = [System.Windows.Thickness]::new(0)
         }
     })
     
@@ -921,7 +1442,7 @@
 
     # Add Ctrl+F keyboard shortcut to focus search box on current tab
     $window.Add_KeyDown({
-        param($sender, $e)
+        param($sourceControl, $e)
         
         # Check if Ctrl+F was pressed
         if ($e.Key -eq [System.Windows.Input.Key]::F -and 
@@ -930,12 +1451,12 @@
             $currentTab = $tabControl.SelectedItem
             
             # Focus AppSearchBox if on App Removal tab
-            if ($currentTab.Header -eq "App Removal" -and $appSearchBox) {
+            if ($currentTab.Header -eq "应用卸载" -and $appSearchBox) {
                 $appSearchBox.Focus()
                 $e.Handled = $true
             }
             # Focus TweakSearchBox if on Tweaks tab
-            elseif ($currentTab.Header -eq "Tweaks" -and $tweakSearchBox) {
+            elseif ($currentTab.Header -eq "系统调整" -and $tweakSearchBox) {
                 $tweakSearchBox.Focus()
                 $e.Handled = $true
             }
@@ -980,9 +1501,6 @@
         
         # Update progress indicators
         # Tab indices: 0=Home, 1=App Removal, 2=Tweaks, 3=Deployment Settings
-        $blueColor = "#0067c0"
-        $greyColor = "#808080"
-        
         $progressIndicator1 = $window.FindName('ProgressIndicator1') # App Removal
         $progressIndicator2 = $window.FindName('ProgressIndicator2') # Tweaks
         $progressIndicator3 = $window.FindName('ProgressIndicator3') # Deployment Settings
@@ -998,23 +1516,23 @@
         # Update indicator colors based on current tab
         # Indicator 1 (App Removal) - tab index 1
         if ($currentIndex -ge 1) {
-            $progressIndicator1.Fill = $blueColor
+            $progressIndicator1.Fill = $window.Resources['ProgressActiveColor']
         } else {
-            $progressIndicator1.Fill = $greyColor
+            $progressIndicator1.Fill = $window.Resources['ProgressInactiveColor']
         }
         
         # Indicator 2 (Tweaks) - tab index 2
         if ($currentIndex -ge 2) {
-            $progressIndicator2.Fill = $blueColor
+            $progressIndicator2.Fill = $window.Resources['ProgressActiveColor']
         } else {
-            $progressIndicator2.Fill = $greyColor
+            $progressIndicator2.Fill = $window.Resources['ProgressInactiveColor']
         }
         
         # Indicator 3 (Deployment Settings) - tab index 3
         if ($currentIndex -ge 3) {
-            $progressIndicator3.Fill = $blueColor
+            $progressIndicator3.Fill = $window.Resources['ProgressActiveColor']
         } else {
-            $progressIndicator3.Fill = $greyColor
+            $progressIndicator3.Fill = $window.Resources['ProgressInactiveColor']
         }
     }
 
@@ -1022,39 +1540,37 @@
     $userSelectionCombo.Add_SelectionChanged({
         switch ($userSelectionCombo.SelectedIndex) {
             0 {
-                $userSelectionDescription.Text = "更改将应用到当前登录的用户配置文件。"
+                $userSelectionDescription.Text = "更改将应用于当前登录的用户配置文件。"
                 $otherUserPanel.Visibility = 'Collapsed'
                 $usernameValidationMessage.Text = ""
-                # Show "仅当前用户" option, hide "仅目标用户" option
+                # Show "Current user only" option, hide "Target user only" option
                 $appRemovalScopeCurrentUser.Visibility = 'Visible'
                 $appRemovalScopeTargetUser.Visibility = 'Collapsed'
-                # Enable app removal scope selection for current user
-                $appRemovalScopeCombo.IsEnabled = $true
                 $appRemovalScopeCombo.SelectedIndex = 0
             }
             1 {
-                $userSelectionDescription.Text = "更改将应用到此系统上的其他用户配置文件。"
+                $userSelectionDescription.Text = "更改将应用于此系统上的其他用户配置文件。"
                 $otherUserPanel.Visibility = 'Visible'
                 $usernameValidationMessage.Text = ""
-                # Hide "仅当前用户" option, show "仅目标用户" option
+                # Hide "Current user only" option, show "Target user only" option
                 $appRemovalScopeCurrentUser.Visibility = 'Collapsed'
                 $appRemovalScopeTargetUser.Visibility = 'Visible'
-                # Enable app removal scope selection for other user
-                $appRemovalScopeCombo.IsEnabled = $true
                 $appRemovalScopeCombo.SelectedIndex = 0
             }
             2 {
-                $userSelectionDescription.Text = "更改将应用到默认用户模板，影响此后创建的所有新用户。适用于 Sysprep 部署。"
+                $userSelectionDescription.Text = "更改将应用于默认用户模板，影响之后创建的所有新用户。适用于 Sysprep 部署。"
                 $otherUserPanel.Visibility = 'Collapsed'
                 $usernameValidationMessage.Text = ""
                 # Hide other user options since they don't apply to default user template
                 $appRemovalScopeCurrentUser.Visibility = 'Collapsed'
                 $appRemovalScopeTargetUser.Visibility = 'Collapsed'
-                # Lock app removal scope to "所有用户" when applying to sysprep
-                $appRemovalScopeCombo.IsEnabled = $false
+                # Lock app removal scope to "All users" when applying to sysprep
                 $appRemovalScopeCombo.SelectedIndex = 0
             }
         }
+
+        # Keep enabled/disabled state in sync with both app selection and user mode.
+        UpdateAppSelectionStatus
     })
 
     # Helper function to update app removal scope description
@@ -1063,13 +1579,13 @@
         if ($selectedItem) {
             switch ($selectedItem.Content) {
                 "所有用户" {
-                    $appRemovalScopeDescription.Text = "将为所有用户卸载应用并从 Windows 映像中移除，防止新用户重新安装。"
+                    $appRemovalScopeDescription.Text = "应用将为所有用户卸载，并从 Windows 映像中移除，以防止新用户重新安装。"
                 }
                 "仅当前用户" {
-                    $appRemovalScopeDescription.Text = "仅为当前用户卸载应用。其他用户和新用户不受影响。"
+                    $appRemovalScopeDescription.Text = "应用将仅为当前用户卸载。其他用户和新用户不会受影响。"
                 }
                 "仅目标用户" {
-                    $appRemovalScopeDescription.Text = "仅为指定的目标用户卸载应用。其他用户和新用户不受影响。"
+                    $appRemovalScopeDescription.Text = "应用将仅为指定的目标用户卸载。其他用户和新用户不会受影响。"
                 }
             }
         }
@@ -1092,45 +1608,26 @@
     })
 
     function ValidateOtherUsername {
-        # Only validate if "其他用户" is selected
+        # Only validate if "Other User" is selected
         if ($userSelectionCombo.SelectedIndex -ne 1) {
             return $true
         }
 
-        $username = $otherUsernameTextBox.Text.Trim()
+        $errorBrush   = $window.Resources['ValidationErrorColor']
+        $successBrush = $window.Resources['ValidationSuccessColor']
+        $validationResult = Test-TargetUserName -UserName $otherUsernameTextBox.Text
 
-        $errorBrush = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.ColorConverter]::ConvertFromString("#c42b1c"))
-        $successBrush = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.ColorConverter]::ConvertFromString("#28a745"))
-
-        if ($username.Length -eq 0) {
-            $usernameValidationMessage.Text = "[X] Please enter a username"
-            $usernameValidationMessage.Foreground = $errorBrush
-            return $false
-        }
-        
-        if ($username -eq $env:USERNAME) {
-            $usernameValidationMessage.Text = "[X] Cannot enter your own username, use 'Current User' option instead"
-            $usernameValidationMessage.Foreground = $errorBrush
-            return $false
-        }
-        
-        $userExists = CheckIfUserExists -Username $username
-
-        if ($userExists) {
-            $usernameValidationMessage.Text = "[OK] User found: $username"
+        $usernameValidationMessage.Text = $validationResult.Message
+        if ($validationResult.IsValid) {
             $usernameValidationMessage.Foreground = $successBrush
             return $true
         }
 
-        $usernameValidationMessage.Text = "[X] User not found, please enter a valid username"
         $usernameValidationMessage.Foreground = $errorBrush
         return $false
     }
 
     function GenerateOverview {
-        # Load Features.json
-        $featuresJson = LoadJsonFile -filePath $script:FeaturesFilePath -expectedVersion "1.0"
-        
         $changesList = @()
         
         # Collect selected apps
@@ -1141,24 +1638,10 @@
             }
         }
         if ($selectedAppsCount -gt 0) {
-            $changesList += "Remove $selectedAppsCount application(s)"
+            $changesList += "卸载 $selectedAppsCount 个应用"
         }
         
-        # Update app removal scope section based on whether apps are selected
-        if ($selectedAppsCount -gt 0) {
-            # Enable app removal scope selection (unless locked by sysprep mode)
-            if ($userSelectionCombo.SelectedIndex -ne 2) {
-                $appRemovalScopeCombo.IsEnabled = $true
-            }
-            $appRemovalScopeSection.Opacity = 1.0
-            UpdateAppRemovalScopeDescription
-        }
-        else {
-            # Disable app removal scope selection when no apps selected
-            $appRemovalScopeCombo.IsEnabled = $false
-            $appRemovalScopeSection.Opacity = 0.5
-            $appRemovalScopeDescription.Text = "No apps selected for removal."
-        }
+        UpdateAppSelectionStatus
         
         # Collect all ComboBox/CheckBox selections from dynamically created controls
         if ($script:UiControlMappings) {
@@ -1180,13 +1663,14 @@
                         # For combobox: SelectedIndex 0 = No Change, so subtract 1 to index into Values
                         $selectedValue = $mapping.Values[$control.SelectedIndex - 1]
                         foreach ($fid in $selectedValue.FeatureIds) {
-                            $feature = $featuresJson.Features | Where-Object { $_.FeatureId -eq $fid }
-                            if ($feature) { $changesList += ($feature.Action + ' ' + $feature.Label) }
+                            $label = $script:FeatureLabelLookup[$fid]
+                            if ($label) { $changesList += $label }
                         }
                     }
                     elseif ($mapping.Type -eq 'feature') {
-                        $feature = $featuresJson.Features | Where-Object { $_.FeatureId -eq $mapping.FeatureId }
-                        if ($feature) { $changesList += ($feature.Action + ' ' + $feature.Label) }
+                        $label = $script:FeatureLabelLookup[$mapping.FeatureId]
+                        if (-not $label) { $label = $mapping.Label }
+                        $changesList += $label
                     }
                 }
             }
@@ -1199,25 +1683,25 @@
         $changesList = GenerateOverview
 
         if ($changesList.Count -eq 0) {
-            Show-MessageBox -Message 'No changes have been selected.' -Title 'Selected Changes' -Button 'OK' -Icon 'Information'
+            Show-MessageBox -Message '尚未选择任何变更。' -Title '所选变更' -Button 'OK' -Icon 'Information'
             return
         }
 
         $message = ($changesList | ForEach-Object { "$([char]0x2022) $_" }) -join "`n"
-        Show-MessageBox -Message $message -Title 'Selected Changes' -Button 'OK' -Icon 'None' -Width 600
+        Show-MessageBox -Message $message -Title '所选变更' -Button 'OK' -Icon 'None' -Width 600
     }
 
-    $previousBtn.Add_Click({        
+    $previousBtn.Add_Click({
+        Hide-Bubble -Immediate
         if ($tabControl.SelectedIndex -gt 0) {
             $tabControl.SelectedIndex--
             UpdateNavigationButtons
         }
     })
 
-    $nextBtn.Add_Click({        
+    $nextBtn.Add_Click({
         if ($tabControl.SelectedIndex -lt ($tabControl.Items.Count - 1)) {
             $tabControl.SelectedIndex++
-            
             UpdateNavigationButtons
         }
     })
@@ -1239,21 +1723,27 @@
             ApplySettingsToUiControls -window $window -settingsJson $defaultsJson -uiControlMappings $script:UiControlMappings
         }
 
-        # Select default apps
-        foreach ($child in $appsPanel.Children) {
-            if ($child -is [System.Windows.Controls.CheckBox]) {
-                $child.IsChecked = ($child.SelectedByDefault -eq $true)
-            }
+        # Deselect all apps, then select default apps (defer if apps are still loading in the background)
+        if ($script:IsLoadingApps) {
+            $script:PendingDefaultMode = $true
+        } else {
+            ApplyPresetToApps -MatchFilter { param($c) $c.SelectedByDefault -eq $true } -Exclusive
         }
 
         # Navigate directly to the Deployment Settings tab
         $tabControl.SelectedIndex = 3
         UpdateNavigationButtons
+
+        # Show contextual hint bubble for the Review Changes link
+        $window.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Loaded, [action]{
+            Show-Bubble -TargetControl $reviewChangesBtn -Message '在此查看所选变更'
+        }) | Out-Null
     })
 
     # Handle Review Changes link button
     $reviewChangesBtn = $window.FindName('ReviewChangesBtn')
     $reviewChangesBtn.Add_Click({
+        Hide-Bubble
         ShowChangesOverview
     })
 
@@ -1261,22 +1751,31 @@
     $deploymentApplyBtn = $window.FindName('DeploymentApplyBtn')
     $deploymentApplyBtn.Add_Click({
         if (-not (ValidateOtherUsername)) {
-            Show-MessageBox -Message "Please enter a valid username." -Title "Invalid Username" -Button 'OK' -Icon 'Warning' | Out-Null
+            $validationMessage = if (-not [string]::IsNullOrWhiteSpace($usernameValidationMessage.Text)) {
+                $usernameValidationMessage.Text
+            }
+            else {
+                "请输入有效的用户名。"
+            }
+            Show-MessageBox -Message $validationMessage -Title "无效的用户名" -Button 'OK' -Icon 'Warning' | Out-Null
             return
         }
+
+        Hide-Bubble -Immediate
 
         # App Removal - collect selected apps from integrated UI
         $selectedApps = @()
         foreach ($child in $appsPanel.Children) {
             if ($child -is [System.Windows.Controls.CheckBox] -and $child.IsChecked) {
-                $selectedApps += $child.Tag
+                $selectedApps += @($child.AppIds)
             }
         }
+        $selectedApps = @($selectedApps | Where-Object { $_ } | Select-Object -Unique)
         
         if ($selectedApps.Count -gt 0) {
             # Check if Microsoft Store is selected
             if ($selectedApps -contains "Microsoft.WindowsStore") {
-                $result = Show-MessageBox -Message 'Are you sure you wish to uninstall the Microsoft Store? This app cannot easily be reinstalled.' -Title 'Are you sure?' -Button 'YesNo' -Icon 'Warning'
+                $result = Show-MessageBox -Message '确定要卸载 Microsoft Store 吗？此应用无法轻松重新安装。' -Title '确定吗？' -Button 'YesNo' -Icon 'Warning'
 
                 if ($result -eq 'No') {
                     return
@@ -1354,7 +1853,7 @@
         }
 
         if ($totalChanges -eq 0) {
-            Show-MessageBox -Message 'No changes have been selected, please select at least one option to proceed.' -Title 'No Changes Selected' -Button 'OK' -Icon 'Information'
+            Show-MessageBox -Message '尚未选择任何变更，请至少选择一个选项以继续。' -Title '未选择变更' -Button 'OK' -Icon 'Information'
             return
         }
 
@@ -1366,8 +1865,17 @@
         
         # Store selected user mode
         switch ($userSelectionCombo.SelectedIndex) {
-            1 { AddParameter User ($otherUsernameTextBox.Text.Trim()) }
-            2 { AddParameter Sysprep }
+            0 {
+                Write-Host "已选择的用户模式：当前用户 ($(GetUserName))"
+            }
+            1 {
+                Write-Host "已选择的用户模式：$($otherUsernameTextBox.Text.Trim())"
+                AddParameter User ($otherUsernameTextBox.Text.Trim())
+            }
+            2 {
+                Write-Host "已选择的用户模式：默认用户配置文件 (Sysprep)"
+                AddParameter Sysprep
+            }
         }
 
         SaveSettings
@@ -1386,6 +1894,10 @@
     # Initialize UI elements on window load
     $window.Add_Loaded({
         BuildDynamicTweaks
+        UpdateTweaksResponsiveColumns
+        RefreshTweakPresetSources -defaultSettingsJson $defaultsJson -lastUsedSettingsJson $lastUsedSettingsJson
+        RegisterTweakPresetControlStateHandlers
+        UpdateTweakPresetStates
 
         LoadAppsIntoMainUI
 
@@ -1393,7 +1905,7 @@
         if ($userSelectionCombo -and $userSelectionCombo.Items.Count -gt 0) {
             $currentUserItem = $userSelectionCombo.Items[0]
             if ($currentUserItem -is [System.Windows.Controls.ComboBoxItem]) {
-                $currentUserItem.Content = "Current User ($(GetUserName))"
+                $currentUserItem.Content = "当前用户 ($(GetUserName))"
             }
         }
 
@@ -1428,91 +1940,309 @@
         UpdateNavigationButtons
     })
 
-    # Handle Load Defaults button
-    $loadDefaultsBtn = $window.FindName('LoadDefaultsBtn')
-    $loadDefaultsBtn.Add_Click({
-        $defaultsJson = LoadJsonFile -filePath $script:DefaultSettingsFilePath -expectedVersion "1.0"
+    function BuildTweakPresetControlMap {
+        param($settingsJson)
 
-        if (-not $defaultsJson) {
-            Show-MessageBox -Message "Failed to load default settings file" -Title "Error" -Button 'OK' -Icon 'Error'
-            return
+        $presetMap = @{}
+        if (-not $settingsJson -or -not $settingsJson.Settings -or -not $script:UiControlMappings) {
+            return $presetMap
         }
-        
-        ApplySettingsToUiControls -window $window -settingsJson $defaultsJson -uiControlMappings $script:UiControlMappings
-    })
 
-    # Handle Load Last Used settings and Load Last Used apps
-    $loadLastUsedBtn = $window.FindName('LoadLastUsedBtn')
-    $loadLastUsedAppsBtn = $window.FindName('LoadLastUsedAppsBtn')
+        # FeatureId -> control metadata, similar to ApplySettingsToUiControls lookup.
+        $featureIdIndex = @{}
+        foreach ($controlName in $script:UiControlMappings.Keys) {
+            $control = $window.FindName($controlName)
+            if (-not $control -or $control.Visibility -ne 'Visible') { continue }
 
-    $lastUsedSettingsJson = LoadJsonFile -filePath $script:SavedSettingsFilePath -expectedVersion "1.0" -optionalFile
-
-    $hasSettings = $false
-    $appsSetting = $null
-    if ($lastUsedSettingsJson -and $lastUsedSettingsJson.Settings) {
-        foreach ($s in $lastUsedSettingsJson.Settings) {
-            # Only count as hasSettings if a setting other than RemoveApps/Apps is present and true
-            if ($s.Value -eq $true -and $s.Name -ne 'RemoveApps' -and $s.Name -ne 'Apps') { $hasSettings = $true }
-            if ($s.Name -eq 'Apps' -and $s.Value) { $appsSetting = $s.Value }
+            $mapping = $script:UiControlMappings[$controlName]
+            if ($mapping.Type -eq 'group') {
+                $i = 1
+                foreach ($val in $mapping.Values) {
+                    foreach ($fid in $val.FeatureIds) {
+                        $featureIdIndex[$fid] = @{ ControlName = $controlName; Control = $control; MappingType = 'group'; Index = $i }
+                    }
+                    $i++
+                }
+            }
+            elseif ($mapping.Type -eq 'feature') {
+                $featureIdIndex[$mapping.FeatureId] = @{ ControlName = $controlName; Control = $control; MappingType = 'feature' }
+            }
         }
-    }
 
-    # Show option to load last used settings if they exist
-    if ($hasSettings) {
-        $loadLastUsedBtn.Add_Click({
-            try {
-                ApplySettingsToUiControls -window $window -settingsJson $lastUsedSettingsJson -uiControlMappings $script:UiControlMappings
+        foreach ($setting in $settingsJson.Settings) {
+            if ($setting.Value -ne $true) { continue }
+            if ($setting.Name -eq 'CreateRestorePoint') { continue }
+
+            $entry = $featureIdIndex[$setting.Name]
+            if (-not $entry) { continue }
+            if ($presetMap.ContainsKey($entry.ControlName)) { continue }
+
+            $controlType = if ($entry.Control -is [System.Windows.Controls.CheckBox]) { 'CheckBox' } else { 'ComboBox' }
+            $desiredValue = switch ($entry.MappingType) {
+                'group'   { $entry.Index }
+                default   { if ($controlType -eq 'CheckBox') { $true } else { 1 } }
             }
-            catch {
-                Show-MessageBox -Message "Failed to load last used settings: $_" -Title "Error" -Button 'OK' -Icon 'Error'
+
+            $presetMap[$entry.ControlName] = @{ Control = $entry.Control; ControlType = $controlType; DesiredValue = $desiredValue }
+        }
+
+        return $presetMap
+    }
+
+    function BuildCategoryTweakPresetMap {
+        param([string]$Category)
+
+        $presetMap = @{}
+        if (-not $script:UiControlMappings) { return $presetMap }
+
+        foreach ($controlName in $script:UiControlMappings.Keys) {
+            $mapping = $script:UiControlMappings[$controlName]
+            if ($mapping.Category -ne $Category) { continue }
+
+            $control = $window.FindName($controlName)
+            if (-not $control -or $control.Visibility -ne 'Visible') { continue }
+
+            $controlType = if ($control -is [System.Windows.Controls.CheckBox]) { 'CheckBox' } else { 'ComboBox' }
+            $desiredValue = if ($controlType -eq 'CheckBox') { $true } else { 1 }
+            $presetMap[$controlName] = @{ Control = $control; ControlType = $controlType; DesiredValue = $desiredValue }
+        }
+
+        return $presetMap
+    }
+
+    function GetSavedAppIdsFromSettingsJson {
+        param($settingsJson)
+
+        if (-not $settingsJson -or -not $settingsJson.Settings) {
+            return $null
+        }
+
+        $appsValue = $null
+        foreach ($setting in $settingsJson.Settings) {
+            if ($setting.Name -eq 'Apps' -and $setting.Value) {
+                $appsValue = $setting.Value
+                break
             }
-        })
-    }
-    else {
-        $loadLastUsedBtn.Visibility = 'Collapsed'
+        }
+
+        if (-not $appsValue) {
+            return $null
+        }
+
+        $savedAppIds = @()
+        if ($appsValue -is [string]) {
+            $savedAppIds = $appsValue.Split(',')
+        }
+        elseif ($appsValue -is [array]) {
+            $savedAppIds = $appsValue
+        }
+
+        $savedAppIds = $savedAppIds | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+        if ($savedAppIds.Count -eq 0) {
+            return $null
+        }
+
+        return $savedAppIds
     }
 
-    # Show option to load last used apps if they exist
-    if ($appsSetting -and $appsSetting.ToString().Trim().Length -gt 0) {
-        $loadLastUsedAppsBtn.Add_Click({
-            try {
-                $savedApps = @()
-                if ($appsSetting -is [string]) { $savedApps = $appsSetting.Split(',') }
-                elseif ($appsSetting -is [array]) { $savedApps = $appsSetting }
-                $savedApps = $savedApps | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+    function ApplyTweakPresetMap {
+        param(
+            [hashtable]$PresetMap,
+            [bool]$Check
+        )
 
-                foreach ($child in $appsPanel.Children) {
-                    if ($child -is [System.Windows.Controls.CheckBox]) {
-                        if ($savedApps -contains $child.Tag) { $child.IsChecked = $true } else { $child.IsChecked = $false }
+        if (-not $PresetMap) {
+            $PresetMap = @{}
+        }
+
+        $wasUpdatingTweakPresets = [bool]$script:UpdatingTweakPresets
+        $script:UpdatingTweakPresets = $true
+        try {
+            foreach ($target in $PresetMap.Values) {
+                $control = $target.Control
+                if (-not $control) { continue }
+
+                if ($target.ControlType -eq 'CheckBox') {
+                    $control.IsChecked = $Check
+                }
+                elseif ($target.ControlType -eq 'ComboBox') {
+                    $desiredIndex = [int]$target.DesiredValue
+                    if ($Check) {
+                        $control.SelectedIndex = $desiredIndex
+                    }
+                    elseif ($control.SelectedIndex -eq $desiredIndex) {
+                        $control.SelectedIndex = 0
                     }
                 }
             }
-            catch {
-                Show-MessageBox -Message "Failed to load last used app selection: $_" -Title "Error" -Button 'OK' -Icon 'Error'
+        }
+        finally {
+            $script:UpdatingTweakPresets = $wasUpdatingTweakPresets
+        }
+
+        if (-not $wasUpdatingTweakPresets) {
+            UpdateTweakPresetStates
+        }
+    }
+
+    function SetTweakPresetState {
+        param(
+            [System.Windows.Controls.CheckBox]$PresetCheckBox,
+            [hashtable]$PresetMap
+        )
+
+        if (-not $PresetCheckBox) { return }
+        if (-not $PresetMap) {
+            $PresetMap = @{}
+        }
+
+        $total = $PresetMap.Count
+        $selected = 0
+
+        foreach ($target in $PresetMap.Values) {
+            $control = $target.Control
+            if (-not $control) { continue }
+
+            if ($target.ControlType -eq 'CheckBox' -and $control.IsChecked -eq $true) {
+                $selected++
             }
+            elseif ($target.ControlType -eq 'ComboBox' -and $control.SelectedIndex -eq [int]$target.DesiredValue) {
+                $selected++
+            }
+        }
+
+        SetTriStatePresetCheckBoxState -CheckBox $PresetCheckBox -Total $total -Selected $selected
+    }
+
+    function UpdateTweakPresetStates {
+        $script:UpdatingTweakPresets = $true
+        try {
+            SetTweakPresetState -PresetCheckBox $presetDefaultTweaksBtn -PresetMap $script:DefaultTweakPresetMap
+            if ($presetLastUsedTweaksBtn -and $presetLastUsedTweaksBtn.Visibility -ne 'Collapsed') {
+                SetTweakPresetState -PresetCheckBox $presetLastUsedTweaksBtn -PresetMap $script:LastUsedTweakPresetMap
+            }
+            SetTweakPresetState -PresetCheckBox $presetPrivacyTweaksBtn -PresetMap $script:PrivacyTweakPresetMap
+            SetTweakPresetState -PresetCheckBox $presetAITweaksBtn -PresetMap $script:AITweakPresetMap
+        }
+        finally {
+            $script:UpdatingTweakPresets = $false
+        }
+    }
+
+    function RegisterTweakPresetControlStateHandlers {
+        if (-not $script:UiControlMappings) { return }
+
+        foreach ($controlName in $script:UiControlMappings.Keys) {
+            $control = $window.FindName($controlName)
+            if (-not $control) { continue }
+
+            if ($control -is [System.Windows.Controls.CheckBox]) {
+                $control.Add_Checked({ if (-not $script:UpdatingTweakPresets) { UpdateTweakPresetStates } })
+                $control.Add_Unchecked({ if (-not $script:UpdatingTweakPresets) { UpdateTweakPresetStates } })
+            }
+            elseif ($control -is [System.Windows.Controls.ComboBox]) {
+                $control.Add_SelectionChanged({ if (-not $script:UpdatingTweakPresets) { UpdateTweakPresetStates } })
+            }
+        }
+    }
+
+    function RefreshTweakPresetSources {
+        param(
+            $defaultSettingsJson,
+            $lastUsedSettingsJson
+        )
+
+        $script:DefaultTweakPresetMap = BuildTweakPresetControlMap -settingsJson $defaultSettingsJson
+        $script:LastUsedTweakPresetMap = BuildTweakPresetControlMap -settingsJson $lastUsedSettingsJson
+        $script:PrivacyTweakPresetMap = BuildCategoryTweakPresetMap -Category '隐私与建议内容'
+        $script:AITweakPresetMap = BuildCategoryTweakPresetMap -Category 'AI'
+
+        if ($presetLastUsedTweaksBtn) {
+            $presetLastUsedTweaksBtn.Visibility = if ($script:LastUsedTweakPresetMap.Count -gt 0) { 'Visible' } else { 'Collapsed' }
+        }
+    }
+
+    $lastUsedSettingsJson = LoadJsonFile -filePath $script:SavedSettingsFilePath -expectedVersion "1.0" -optionalFile
+
+    $defaultsJson = LoadJsonFile -filePath $script:DefaultSettingsFilePath -expectedVersion "1.0"
+    $script:DefaultTweakPresetMap = @{}
+    $script:LastUsedTweakPresetMap = @{}
+    $script:PrivacyTweakPresetMap = @{}
+    $script:AITweakPresetMap = @{}
+    $script:SavedAppIds = GetSavedAppIdsFromSettingsJson -settingsJson $lastUsedSettingsJson
+
+    if ($presetDefaultTweaksBtn) {
+        $presetDefaultTweaksBtn.Add_Click({
+            if ($script:UpdatingTweakPresets) { return }
+            $check = NormalizeCheckboxState -checkBox $this
+            ApplyTweakPresetMap -PresetMap $script:DefaultTweakPresetMap -Check $check
+        })
+    }
+
+    if ($presetLastUsedTweaksBtn) {
+        $presetLastUsedTweaksBtn.Add_Click({
+            if ($script:UpdatingTweakPresets) { return }
+            $check = NormalizeCheckboxState -checkBox $this
+            ApplyTweakPresetMap -PresetMap $script:LastUsedTweakPresetMap -Check $check
+        })
+    }
+
+    if ($presetPrivacyTweaksBtn) {
+        $presetPrivacyTweaksBtn.Add_Click({
+            if ($script:UpdatingTweakPresets) { return }
+            $check = NormalizeCheckboxState -checkBox $this
+            ApplyTweakPresetMap -PresetMap $script:PrivacyTweakPresetMap -Check $check
+        })
+    }
+
+    if ($presetAITweaksBtn) {
+        $presetAITweaksBtn.Add_Click({
+            if ($script:UpdatingTweakPresets) { return }
+            $check = NormalizeCheckboxState -checkBox $this
+            ApplyTweakPresetMap -PresetMap $script:AITweakPresetMap -Check $check
+        })
+    }
+
+    # Hide Last used tweak preset by default; it is shown after dynamic controls are built and mappings are resolved.
+    if ($presetLastUsedTweaksBtn) {
+        $presetLastUsedTweaksBtn.Visibility = 'Collapsed'
+    }
+
+    # Preset: Last used selection (wired to PresetLastUsed checkbox)
+    if ($script:SavedAppIds) {
+        $presetLastUsed.Add_Click({
+            if ($script:UpdatingPresets) { return }
+            $check = NormalizeCheckboxState -checkBox $this
+            ApplyPresetToApps -MatchFilter { param($c) (@($c.AppIds) | Where-Object { $script:SavedAppIds -contains $_ }).Count -gt 0 } -Check $check
         })
     }
     else {
-        $loadLastUsedAppsBtn.Visibility = 'Collapsed'
+        $script:SavedAppIds = $null
+        $presetLastUsed.Visibility = 'Collapsed'
     }
 
     # Clear All Tweaks button
     $clearAllTweaksBtn = $window.FindName('ClearAllTweaksBtn')
     $clearAllTweaksBtn.Add_Click({
-        # Reset all ComboBoxes to index 0 (No Change) and uncheck all CheckBoxes
-        if ($script:UiControlMappings) {
-            foreach ($comboName in $script:UiControlMappings.Keys) {
-                $control = $window.FindName($comboName)
-                if ($control -is [System.Windows.Controls.CheckBox]) {
-                    $control.IsChecked = $false
-                }
-                elseif ($control -is [System.Windows.Controls.ComboBox]) {
-                    $control.SelectedIndex = 0
-                }
-            }
-        } 
+        ClearTweakSelections
+        UpdateTweakPresetStates
     })
 
+    # Preload app data to speed up loading when user navigates to App Removal tab
+    try {
+        $script:PreloadedAppData = LoadAppsDetailsFromJson -OnlyInstalled:$false -InstalledList '' -InitialCheckedFromJson:$false
+    }
+    catch {
+        Write-Warning "预加载应用列表失败：$_"
+    }
+
     # Show the window
-    return $window.ShowDialog()
+    $frame = [System.Windows.Threading.DispatcherFrame]::new()
+    $window.Add_Closed({
+        $frame.Continue = $false
+    })
+
+    $window.Show() | Out-Null
+    [System.Windows.Threading.Dispatcher]::PushFrame($frame)
+    return $null
 }

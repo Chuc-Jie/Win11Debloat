@@ -1,6 +1,4 @@
-﻿#Requires -RunAsAdministrator
-
-[CmdletBinding(SupportsShouldProcess)]
+﻿[CmdletBinding(SupportsShouldProcess)]
 param (
     [switch]$CLI,
     [switch]$Silent,
@@ -13,6 +11,7 @@ param (
     [switch]$RunDefaults,
     [switch]$RunDefaultsLite,
     [switch]$RunSavedSettings,
+    [string]$Config,
     [string]$Apps,
     [string]$AppRemovalTarget,
     [switch]$RemoveApps,
@@ -97,29 +96,78 @@ param (
     [switch]$HideMusic,
     [switch]$HideIncludeInLibrary,
     [switch]$HideGiveAccessTo,
-    [switch]$HideShare
+    [switch]$HideShare,
+    [switch]$ShowDriveLettersFirst,
+    [switch]$ShowDriveLettersLast,
+    [switch]$ShowNetworkDriveLettersFirst,
+    [switch]$HideDriveLetters
 )
 
+# Check if script is running as administrator
+$isAdmin = ([Security.Principal.WindowsPrincipal] `
+    [Security.Principal.WindowsIdentity]::GetCurrent()
+).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
+# If script is not running as administrator ask user if they want to allow it
+if (-not $isAdmin) {
+    Write-Host "Win11Debloat 必须以管理员身份运行。" -ForegroundColor Red
+
+    $choice = Read-Host "是否以管理员身份重新启动？(y/n)"
+
+    if ($choice -match '^[Yy]$') {
+        $elevatedArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $PSCommandPath)
+
+        foreach ($paramName in $PSBoundParameters.Keys) {
+            $paramValue = $PSBoundParameters[$paramName]
+
+            if ($paramValue -is [System.Management.Automation.SwitchParameter]) {
+                if ($paramValue.IsPresent) {
+                    $elevatedArgs += "-$paramName"
+                }
+            }
+            else {
+                $elevatedArgs += "-$paramName"
+                $elevatedArgs += "$paramValue"
+            }
+        }
+
+        if ($MyInvocation.UnboundArguments.Count -gt 0) {
+            $elevatedArgs += $MyInvocation.UnboundArguments
+        }
+
+        Start-Process powershell -ArgumentList $elevatedArgs -Verb RunAs
+    }
+    exit
+}
 
 # Define script-level variables & paths
-$script:Version = "2026.03.09"
-$script:AppsListFilePath = "$PSScriptRoot/Config/Apps.json"
-$script:DefaultSettingsFilePath = "$PSScriptRoot/Config/DefaultSettings.json"
-$script:FeaturesFilePath = "$PSScriptRoot/Config/Features.json"
-$script:SavedSettingsFilePath = "$PSScriptRoot/Config/LastUsedSettings.json"
-$script:CustomAppsListFilePath = "$PSScriptRoot/Config/CustomAppsList"
-$script:DefaultLogPath = "$PSScriptRoot/Logs/Win11Debloat.log"
-$script:RegfilesPath = "$PSScriptRoot/Regfiles"
-$script:AssetsPath = "$PSScriptRoot/Assets"
-$script:AppSelectionSchema = "$PSScriptRoot/Schemas/AppSelectionWindow.xaml"
-$script:MainWindowSchema = "$PSScriptRoot/Schemas/MainWindow.xaml"
-$script:MessageBoxSchema = "$PSScriptRoot/Schemas/MessageBoxWindow.xaml"
-$script:AboutWindowSchema = "$PSScriptRoot/Schemas/AboutWindow.xaml"
-$script:ApplyChangesWindowSchema = "$PSScriptRoot/Schemas/ApplyChangesWindow.xaml"
-$script:SharedStylesSchema = "$PSScriptRoot/Schemas/SharedStyles.xaml"
+$script:Version = "2026.05.20"
+$configPath = Join-Path $PSScriptRoot 'Config'
+$logsPath = Join-Path $PSScriptRoot 'Logs'
+$schemasPath = Join-Path $PSScriptRoot 'Schemas'
+$scriptsPath = Join-Path $PSScriptRoot 'Scripts'
 
-$script:ControlParams = 'WhatIf', 'Confirm', 'Verbose', 'Debug', 'LogPath', 'Silent', 'Sysprep', 'User', 'NoRestartExplorer', 'RunDefaults', 'RunDefaultsLite', 'RunSavedSettings', 'RunAppsListGenerator', 'CLI', 'AppRemovalTarget'
+$script:AppsListFilePath = Join-Path $configPath 'Apps.json'
+$script:DefaultSettingsFilePath = Join-Path $configPath 'DefaultSettings.json'
+$script:FeaturesFilePath = Join-Path $configPath 'Features.json'
+$script:SavedSettingsFilePath = Join-Path $configPath 'LastUsedSettings.json'
+$script:CustomAppsListFilePath = Join-Path $configPath 'CustomAppsList'
+$script:DefaultLogPath = Join-Path $logsPath 'Win11Debloat.log'
+$script:RegfilesPath = Join-Path $PSScriptRoot 'Regfiles'
+$script:RegistryBackupsPath = Join-Path $PSScriptRoot 'Backups'
+$script:AssetsPath = Join-Path $PSScriptRoot 'Assets'
+$script:AppSelectionSchema = Join-Path $schemasPath 'AppSelectionWindow.xaml'
+$script:MainWindowSchema = Join-Path $schemasPath 'MainWindow.xaml'
+$script:MessageBoxSchema = Join-Path $schemasPath 'MessageBoxWindow.xaml'
+$script:AboutWindowSchema = Join-Path $schemasPath 'AboutWindow.xaml'
+$script:ApplyChangesWindowSchema = Join-Path $schemasPath 'ApplyChangesWindow.xaml'
+$script:SharedStylesSchema = Join-Path $schemasPath 'SharedStyles.xaml'
+$script:BubbleHintSchema = Join-Path $schemasPath 'BubbleHint.xaml'
+$script:ImportExportConfigSchema = Join-Path $schemasPath 'ImportExportConfigWindow.xaml'
+$script:RestoreBackupWindowSchema = Join-Path $schemasPath 'RestoreBackupWindow.xaml'
+$script:LoadAppsDetailsScriptPath = Join-Path (Join-Path $scriptsPath 'FileIO') 'LoadAppsDetailsFromJson.ps1'
+
+$script:ControlParams = 'WhatIf', 'Confirm', 'Verbose', 'Debug', 'LogPath', 'Silent', 'Sysprep', 'User', 'NoRestartExplorer', 'RunDefaults', 'RunDefaultsLite', 'RunSavedSettings', 'Config', 'RunAppsListGenerator', 'CLI', 'AppRemovalTarget'
 
 # Script-level variables for GUI elements
 $script:GuiWindow = $null
@@ -129,14 +177,22 @@ $script:ApplySubStepCallback = $null
 
 # Check if current powershell environment is limited by security policies
 if ($ExecutionContext.SessionState.LanguageMode -ne "FullLanguage") {
-    Write-Error "Win11Debloat 无法在您的系统上运行，PowerShell 执行受到安全策略限制"
+    Write-Error "Win11Debloat 无法在您的系统上运行，PowerShell 执行被安全策略限制"
     Write-Output "按任意键退出..."
     $null = [System.Console]::ReadKey()
     Exit
 }
 
-# Display ASCII art launch logo in CLI
 Clear-Host
+
+# Ensure required Windows command paths are present in PATH for this session.
+$system32Path = "$env:SystemRoot\System32"
+if ($env:PATH -notmatch "(?i)(^|;)$([regex]::Escape($system32Path))(?=;|$)") {
+    $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot;" + $env:PATH
+    Write-Warning "PATH 环境变量中缺少 System32 路径，已为本会话添加。"
+}
+
+# Display ASCII art launch logo in CLI
 Write-Host ""
 Write-Host ""
 Write-Host "                   " -NoNewline; Write-Host "      ^" -ForegroundColor Blue
@@ -151,24 +207,24 @@ Write-Host "                   " -NoNewline; Write-Host "  |       |" -Foregroun
 Write-Host "                   " -NoNewline; Write-Host " /|       |\" -ForegroundColor Blue
 Write-Host "                   " -NoNewline; Write-Host "/ |       | \" -ForegroundColor Blue
 Write-Host "                   " -NoNewline; Write-Host "  |  " -ForegroundColor DarkGray -NoNewline; Write-Host "'''" -ForegroundColor Red -NoNewline; Write-Host "  |" -ForegroundColor DarkGray -NoNewline; Write-Host "    *" -ForegroundColor Yellow
-Write-Host "                   " -NoNewline; Write-Host "   (" -ForegroundColor Yellow -NoNewline; Write-Host "'''" -ForegroundColor Red -NoNewline; Write-Host ") " -ForegroundColor Yellow -NoNewline; Write-Host "   *  *" -ForegroundColor DarkYellow
-Write-Host "                   " -NoNewline; Write-Host "   ( " -ForegroundColor DarkYellow -NoNewline; Write-Host "'" -ForegroundColor Red -NoNewline; Write-Host " )   " -ForegroundColor DarkYellow -NoNewline; Write-Host "*" -ForegroundColor Yellow
+Write-Host "                   " -NoNewline; Write-Host "    (" -ForegroundColor Yellow -NoNewline; Write-Host "'''" -ForegroundColor Red -NoNewline; Write-Host ") " -ForegroundColor Yellow -NoNewline; Write-Host "   *  *" -ForegroundColor DarkYellow
+Write-Host "                   " -NoNewline; Write-Host "    ( " -ForegroundColor DarkYellow -NoNewline; Write-Host "'" -ForegroundColor Red -NoNewline; Write-Host " )   " -ForegroundColor DarkYellow -NoNewline; Write-Host "*" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "             Win11Debloat 正在启动..." -ForegroundColor White
-Write-Host "               请勿关闭此窗口" -ForegroundColor DarkGray
+Write-Host "                请保持此窗口打开" -ForegroundColor DarkGray
 Write-Host ""
 
 # Log script output to 'Win11Debloat.log' at the specified path
 if ($LogPath -and (Test-Path $LogPath)) {
-    Start-Transcript -Path "$LogPath/Win11Debloat.log" -Append -IncludeInvocationHeader -Force | Out-Null
+    Start-Transcript -Path (Join-Path $LogPath 'Win11Debloat.log') -Append -IncludeInvocationHeader -Force | Out-Null
 }
 else {
     Start-Transcript -Path $script:DefaultLogPath -Append -IncludeInvocationHeader -Force | Out-Null
 }
 
 # Check if script has all required files
-if (-not ((Test-Path $script:DefaultSettingsFilePath) -and (Test-Path $script:AppsListFilePath) -and (Test-Path $script:RegfilesPath) -and (Test-Path $script:AssetsPath) -and (Test-Path $script:AppSelectionSchema) -and (Test-Path $script:ApplyChangesWindowSchema) -and (Test-Path $script:SharedStylesSchema) -and (Test-Path $script:FeaturesFilePath))) {
-    Write-Error "Win11Debloat 无法找到所需文件，请确保所有脚本文件完整"
+if (-not ((Test-Path $script:DefaultSettingsFilePath) -and (Test-Path $script:AppsListFilePath) -and (Test-Path $script:RegfilesPath) -and (Test-Path $script:AssetsPath) -and (Test-Path $script:AppSelectionSchema) -and (Test-Path $script:ApplyChangesWindowSchema) -and (Test-Path $script:SharedStylesSchema) -and (Test-Path $script:BubbleHintSchema) -and (Test-Path $script:RestoreBackupWindowSchema) -and (Test-Path $script:FeaturesFilePath))) {
+    Write-Error "Win11Debloat 找不到所需文件，请确认所有脚本文件均存在"
     Write-Output ""
     Write-Output "按任意键退出..."
     $null = [System.Console]::ReadKey()
@@ -201,7 +257,7 @@ try {
     }
 }
 catch {
-    Write-Error "无法确定 WinGet 是否已安装，winget 命令失败: $_"
+    Write-Error "无法确定 WinGet 是否已安装，winget 命令执行失败：$_"
     $script:WingetInstalled = $false
 }
 
@@ -217,15 +273,16 @@ if (-not $script:WingetInstalled -and -not $Silent) {
 
 ##################################################################################################################
 #                                                                                                                #
-#                                          FUNCTION IMPORTS/DEFINITIONS                                          #
+#                                                FUNCTION IMPORTS                                                #
 #                                                                                                                #
 ##################################################################################################################
 
-# Load app removal functions
+# App removal functions
 . "$PSScriptRoot/Scripts/AppRemoval/ForceRemoveEdge.ps1"
 . "$PSScriptRoot/Scripts/AppRemoval/RemoveApps.ps1"
+. "$PSScriptRoot/Scripts/AppRemoval/GetInstalledAppsViaWinget.ps1"
 
-# Load CLI functions
+# CLI functions
 . "$PSScriptRoot/Scripts/CLI/AwaitKeyToExit.ps1"
 . "$PSScriptRoot/Scripts/CLI/ShowCLILastUsedSettings.ps1"  
 . "$PSScriptRoot/Scripts/CLI/ShowCLIDefaultModeAppRemovalOptions.ps1"
@@ -235,486 +292,69 @@ if (-not $script:WingetInstalled -and -not $Silent) {
 . "$PSScriptRoot/Scripts/CLI/PrintPendingChanges.ps1"
 . "$PSScriptRoot/Scripts/CLI/PrintHeader.ps1"
 
-# Load Feature functions
+# Features functions
+. "$PSScriptRoot/Scripts/Features/ExecuteChanges.ps1"
 . "$PSScriptRoot/Scripts/Features/CreateSystemRestorePoint.ps1"
+. "$PSScriptRoot/Scripts/Features/BackupRegistryFeatureSelection.ps1"
+. "$PSScriptRoot/Scripts/Features/BackupRegistrySnapshotCapture.ps1"
+. "$PSScriptRoot/Scripts/Features/BackupRegistryState.ps1"
+. "$PSScriptRoot/Scripts/Features/RegistryBackupValidation.ps1"
+. "$PSScriptRoot/Scripts/Features/RestoreRegistryApplyState.ps1"
+. "$PSScriptRoot/Scripts/Features/RestoreRegistryBackup.ps1"
 . "$PSScriptRoot/Scripts/Features/DisableStoreSearchSuggestions.ps1"
 . "$PSScriptRoot/Scripts/Features/EnableWindowsFeature.ps1"
 . "$PSScriptRoot/Scripts/Features/ImportRegistryFile.ps1"
 . "$PSScriptRoot/Scripts/Features/ReplaceStartMenu.ps1"
 . "$PSScriptRoot/Scripts/Features/RestartExplorer.ps1"
 
-# Load GUI functions
-. "$PSScriptRoot/Scripts/GUI/GetSystemUsesDarkMode.ps1"
-. "$PSScriptRoot/Scripts/GUI/SetWindowThemeResources.ps1"
-. "$PSScriptRoot/Scripts/GUI/AttachShiftClickBehavior.ps1"
-. "$PSScriptRoot/Scripts/GUI/ApplySettingsToUiControls.ps1"
-. "$PSScriptRoot/Scripts/GUI/Show-MessageBox.ps1"
-. "$PSScriptRoot/Scripts/GUI/Show-ApplyModal.ps1"
-. "$PSScriptRoot/Scripts/GUI/Show-AppSelectionWindow.ps1"
-. "$PSScriptRoot/Scripts/GUI/Show-MainWindow.ps1"
-. "$PSScriptRoot/Scripts/GUI/Show-AboutDialog.ps1"
-
-# Load File I/O functions
+# File I/O functions
 . "$PSScriptRoot/Scripts/FileIO/LoadJsonFile.ps1"
+. "$PSScriptRoot/Scripts/FileIO/SaveToFile.ps1"
 . "$PSScriptRoot/Scripts/FileIO/SaveSettings.ps1"
 . "$PSScriptRoot/Scripts/FileIO/LoadSettings.ps1"
 . "$PSScriptRoot/Scripts/FileIO/SaveCustomAppsListToFile.ps1"
 . "$PSScriptRoot/Scripts/FileIO/ValidateAppslist.ps1"
 . "$PSScriptRoot/Scripts/FileIO/LoadAppsFromFile.ps1"
 . "$PSScriptRoot/Scripts/FileIO/LoadAppsDetailsFromJson.ps1"
+. "$PSScriptRoot/Scripts/FileIO/LoadAppPresetsFromJson.ps1"
 
-# Processes all pending WPF window messages (input, render, etc.) to keep the UI responsive
-# during long-running operations on the UI thread. Equivalent to Application.DoEvents().
-function DoEvents {
-    if (-not $script:GuiWindow) { return }
-    $frame = [System.Windows.Threading.DispatcherFrame]::new()
-    [System.Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke(
-        [System.Windows.Threading.DispatcherPriority]::Background,
-        [System.Windows.Threading.DispatcherOperationCallback]{
-            param($f)
-            $f.Continue = $false
-            return $null
-        },
-        $frame
-    )
-    [System.Windows.Threading.Dispatcher]::PushFrame($frame)
-}
+# GUI functions
+. "$PSScriptRoot/Scripts/GUI/GetSystemUsesDarkMode.ps1"
+. "$PSScriptRoot/Scripts/GUI/SetWindowThemeResources.ps1"
+. "$PSScriptRoot/Scripts/GUI/AttachShiftClickBehavior.ps1"
+. "$PSScriptRoot/Scripts/GUI/ApplySettingsToUiControls.ps1"
+. "$PSScriptRoot/Scripts/GUI/Show-MessageBox.ps1"
+. "$PSScriptRoot/Scripts/GUI/Show-ConfigWindow.ps1"
+. "$PSScriptRoot/Scripts/GUI/Show-ApplyModal.ps1"
+. "$PSScriptRoot/Scripts/GUI/Show-AppSelectionWindow.ps1"
+. "$PSScriptRoot/Scripts/GUI/Show-RestoreBackupWindow.ps1"
+. "$PSScriptRoot/Scripts/GUI/RestoreBackupDialogFeatureLists.ps1"
+. "$PSScriptRoot/Scripts/GUI/Show-RestoreBackupDialog.ps1"
+. "$PSScriptRoot/Scripts/GUI/Show-MainWindow.ps1"
+. "$PSScriptRoot/Scripts/GUI/Show-AboutDialog.ps1"
+. "$PSScriptRoot/Scripts/GUI/Show-Bubble.ps1"
 
+# Helper functions
+. "$PSScriptRoot/Scripts/Helpers/AddParameter.ps1"
+. "$PSScriptRoot/Scripts/Helpers/ResolveUserProfilePath.ps1"
+. "$PSScriptRoot/Scripts/Helpers/CheckIfUserExists.ps1"
+. "$PSScriptRoot/Scripts/Helpers/CheckModernStandbySupport.ps1"
+. "$PSScriptRoot/Scripts/Helpers/GenerateAppsList.ps1"
+. "$PSScriptRoot/Scripts/Helpers/GetFriendlyRegistryBackupTarget.ps1"
+. "$PSScriptRoot/Scripts/Helpers/GetFriendlyTargetUserName.ps1"
+. "$PSScriptRoot/Scripts/Helpers/ImportConfigToParams.ps1"
+. "$PSScriptRoot/Scripts/Helpers/GetTargetUserForAppRemoval.ps1"
+. "$PSScriptRoot/Scripts/Helpers/Get-RegFileOperations.ps1"
+. "$PSScriptRoot/Scripts/Helpers/Test-TargetUserName.ps1"
+. "$PSScriptRoot/Scripts/Helpers/GetUserDirectory.ps1"
+. "$PSScriptRoot/Scripts/Helpers/GetUserName.ps1"
+. "$PSScriptRoot/Scripts/Helpers/RegistryPathHelpers.ps1"
+. "$PSScriptRoot/Scripts/Helpers/ApplyRegistryRegFile.ps1"
+. "$PSScriptRoot/Scripts/Helpers/TestIfUserIsLoggedIn.ps1"
 
-# Runs a scriptblock in a background PowerShell runspace while keeping the UI responsive.
-# In GUI mode, the work executes on a separate thread and the UI thread pumps messages (~60fps).
-# In CLI mode, the scriptblock runs directly in the current session.
-function Invoke-NonBlocking {
-    param(
-        [scriptblock]$ScriptBlock,
-        [object[]]$ArgumentList = @()
-    )
-
-    if (-not $script:GuiWindow) {
-        return (& $ScriptBlock @ArgumentList)
-    }
-
-    $ps = [powershell]::Create()
-    try {
-        $null = $ps.AddScript($ScriptBlock.ToString())
-        foreach ($arg in $ArgumentList) {
-            $null = $ps.AddArgument($arg)
-        }
-
-        $handle = $ps.BeginInvoke()
-
-        while (-not $handle.IsCompleted) {
-            DoEvents
-            Start-Sleep -Milliseconds 16
-        }
-
-        $result = $ps.EndInvoke($handle)
-
-        if ($result.Count -eq 0) { return $null }
-        if ($result.Count -eq 1) { return $result[0] }
-        return @($result)
-    }
-    finally {
-        $ps.Dispose()
-    }
-}
-
-
-# Add parameter to script and write to file
-function AddParameter {
-    param (
-        $parameterName,
-        $value = $true
-    )
-
-    # Add parameter or update its value if key already exists
-    if (-not $script:Params.ContainsKey($parameterName)) {
-        $script:Params.Add($parameterName, $value)
-    }
-    else {
-        $script:Params[$parameterName] = $value
-    }
-}
-
-
-# Run winget list and return installed apps (sync or async)
-function GetInstalledAppsViaWinget {
-    param (
-        [int]$TimeOut = 10,
-        [switch]$Async
-    )
-
-    if (-not $script:WingetInstalled) { return $null }
-
-    if ($Async) {
-        $wingetListJob = Start-Job { return winget list --accept-source-agreements --disable-interactivity }
-        return @{ Job = $wingetListJob; StartTime = Get-Date }
-    }
-    else {
-        $wingetListJob = Start-Job { return winget list --accept-source-agreements --disable-interactivity }
-        $jobDone = $wingetListJob | Wait-Job -TimeOut $TimeOut
-        if (-not $jobDone) {
-            Remove-Job -Job $wingetListJob -Force -ErrorAction SilentlyContinue
-            return $null
-        }
-        $result = Receive-Job -Job $wingetListJob
-        Remove-Job -Job $wingetListJob -ErrorAction SilentlyContinue
-        return $result
-    }
-}
-
-
-function GetUserName {
-    if ($script:Params.ContainsKey("User")) {
-        return $script:Params.Item("User")
-    }
-
-    return $env:USERNAME
-}
-
-
-
-# Returns the directory path of the specified user, exits script if user path can't be found
-function GetUserDirectory {
-    param (
-        $userName,
-        $fileName = "",
-        $exitIfPathNotFound = $true
-    )
-
-    try {
-        if (-not (CheckIfUserExists -userName $userName) -and $userName -ne "*") {
-            Write-Error "用户 $userName 在此系统上不存在"
-            AwaitKeyToExit
-        }
-
-        $userDirectoryExists = Test-Path "$env:SystemDrive\Users\$userName"
-        $userPath = "$env:SystemDrive\Users\$userName\$fileName"
-
-        if ((Test-Path $userPath) -or ($userDirectoryExists -and (-not $exitIfPathNotFound))) {
-            return $userPath
-        }
-
-        $userDirectoryExists = Test-Path ($env:USERPROFILE -Replace ('\\' + $env:USERNAME + '$'), "\$userName")
-        $userPath = $env:USERPROFILE -Replace ('\\' + $env:USERNAME + '$'), "\$userName\$fileName"
-
-        if ((Test-Path $userPath) -or ($userDirectoryExists -and (-not $exitIfPathNotFound))) {
-            return $userPath
-        }
-    }
-    catch {
-        Write-Error "查找用户 $userName 的目录路径时出错。请确保该用户存在于此系统上"
-        AwaitKeyToExit
-    }
-
-    Write-Error "无法找到用户 $userName 的目录路径"
-    AwaitKeyToExit
-}
-
-
-function CheckIfUserExists {
-    param (
-        $userName
-    )
-
-    if ($userName -match '[<>:"|?*]') {
-        return $false
-    }
-
-    if ([string]::IsNullOrWhiteSpace($userName)) {
-        return $false
-    }
-
-    try {
-        $userExists = Test-Path "$env:SystemDrive\Users\$userName"
-
-        if ($userExists) {
-            return $true
-        }
-
-        $userExists = Test-Path ($env:USERPROFILE -Replace ('\\' + $env:USERNAME + '$'), "\$userName")
-
-        if ($userExists) {
-            return $true
-        }
-    }
-    catch {
-        Write-Error "查找用户 $userName 的目录路径时出错。请确保该用户存在于此系统上"
-    }
-
-    return $false
-}
-
-
-# Target is determined from $script:Params["AppRemovalTarget"] or defaults to "AllUsers"
-# Target values: "AllUsers" (removes for all users + from image), "CurrentUser", or a specific username
-function GetTargetUserForAppRemoval {
-    if ($script:Params.ContainsKey("AppRemovalTarget")) {
-        return $script:Params["AppRemovalTarget"]
-    }
-    
-    return "AllUsers"
-}
-
-
-function GetFriendlyTargetUserName {
-    $target = GetTargetUserForAppRemoval
-
-    switch ($target) {
-        "AllUsers" { return "所有用户" }
-        "CurrentUser" { return "当前用户" }
-        default { return "用户 $target" }
-    }
-}
-
-
-# Check if this machine supports S0 Modern Standby power state. Returns true if S0 Modern Standby is supported, false otherwise.
-function CheckModernStandbySupport {
-    $count = 0
-
-    try {
-        switch -Regex (powercfg /a) {
-            ':' {
-                $count += 1
-            }
-
-            '(.*S0.{1,}\))' {
-                if ($count -eq 1) {
-                    return $true
-                }
-            }
-        }
-    }
-    catch {
-        Write-Host "错误：无法检查 S0 新式待机支持，powercfg 命令失败" -ForegroundColor Red
-        Write-Host ""
-        Write-Host "按任意键继续..."
-        $null = [System.Console]::ReadKey()
-        return $true
-    }
-
-    return $false
-}
-
-
-# Generates a list of apps to remove based on the Apps parameter
-function GenerateAppsList {
-    if (-not ($script:Params["Apps"] -and $script:Params["Apps"] -is [string])) {
-        return @()
-    }
-
-    $appMode = $script:Params["Apps"].toLower()
-
-    switch ($appMode) {
-        'default' {
-            $appsList = LoadAppsFromFile $script:AppsListFilePath
-            return $appsList
-        }
-        default {
-            $appsList = $script:Params["Apps"].Split(',') | ForEach-Object { $_.Trim() }
-            $validatedAppsList = ValidateAppslist $appsList
-            return $validatedAppsList
-        }
-    }
-}
-
-# Executes a single parameter/feature based on its key
-# Parameters:
-#   $paramKey - The parameter name to execute
-function ExecuteParameter {
-    param (
-        [string]$paramKey
-    )
-    
-    # Check if this feature has metadata in Features.json
-    $feature = $null
-    if ($script:Features.ContainsKey($paramKey)) {
-        $feature = $script:Features[$paramKey]
-    }
-    
-    # If feature has RegistryKey and ApplyText, use dynamic ImportRegistryFile
-    if ($feature -and $feature.RegistryKey -and $feature.ApplyText) {
-        ImportRegistryFile "> $($feature.ApplyText)" $feature.RegistryKey
-        
-        # Handle special cases that have additional logic after ImportRegistryFile
-        switch ($paramKey) {
-            'DisableBing' {
-                # Also remove the app package for Bing search
-                RemoveApps 'Microsoft.BingSearch'
-            }
-            'DisableCopilot' {
-                # Also remove the app package for Copilot
-                RemoveApps 'Microsoft.Copilot'
-            }
-            'DisableWidgets' {
-                # Also remove the app package for Widgets
-                RemoveApps 'Microsoft.StartExperiencesApp'
-            }
-        }
-        return
-    }
-    
-    # Handle features without RegistryKey or with special logic
-    switch ($paramKey) {
-        'RemoveApps' {
-            Write-Host "> 正在为$(GetFriendlyTargetUserName)卸载选定的应用..."
-            $appsList = GenerateAppsList
-
-            if ($appsList.Count -eq 0) {
-                Write-Host "未选择有效的应用进行卸载" -ForegroundColor Yellow
-                Write-Host ""
-                return
-            }
-
-            Write-Host "已选择 $($appsList.Count) 个应用进行卸载"
-            RemoveApps $appsList
-        }
-        'RemoveAppsCustom' {
-            Write-Host "> 正在卸载选定的应用..."
-            $appsList = LoadAppsFromFile $script:CustomAppsListFilePath
-
-            if ($appsList.Count -eq 0) {
-                Write-Host "未选择有效的应用进行卸载" -ForegroundColor Yellow
-                Write-Host ""
-                return
-            }
-
-            Write-Host "已选择 $($appsList.Count) 个应用进行卸载"
-            RemoveApps $appsList
-        }
-        'RemoveCommApps' {
-            $appsList = 'Microsoft.windowscommunicationsapps', 'Microsoft.People'
-            Write-Host "> 正在卸载邮件、日历和人脉应用..."
-            RemoveApps $appsList
-            return
-        }
-        'RemoveW11Outlook' {
-            $appsList = 'Microsoft.OutlookForWindows'
-            Write-Host "> 正在卸载新版 Outlook 应用..."
-            RemoveApps $appsList
-            return
-        }
-        'RemoveGamingApps' {
-            $appsList = 'Microsoft.GamingApp', 'Microsoft.XboxGameOverlay', 'Microsoft.XboxGamingOverlay'
-            Write-Host "> 正在卸载游戏相关应用..."
-            RemoveApps $appsList
-            return
-        }
-        'RemoveHPApps' {
-            $appsList = 'AD2F1837.HPAIExperienceCenter', 'AD2F1837.HPJumpStarts', 'AD2F1837.HPPCHardwareDiagnosticsWindows', 'AD2F1837.HPPowerManager', 'AD2F1837.HPPrivacySettings', 'AD2F1837.HPSupportAssistant', 'AD2F1837.HPSureShieldAI', 'AD2F1837.HPSystemInformation', 'AD2F1837.HPQuickDrop', 'AD2F1837.HPWorkWell', 'AD2F1837.myHP', 'AD2F1837.HPDesktopSupportUtilities', 'AD2F1837.HPQuickTouch', 'AD2F1837.HPEasyClean', 'AD2F1837.HPConnectedMusic', 'AD2F1837.HPFileViewer', 'AD2F1837.HPRegistration', 'AD2F1837.HPWelcome', 'AD2F1837.HPConnectedPhotopoweredbySnapfish', 'AD2F1837.HPPrinterControl'
-            Write-Host "> 正在卸载 HP 应用..."
-            RemoveApps $appsList
-            return
-        }
-        "EnableWindowsSandbox" {
-            Write-Host "> 正在启用 Windows 沙盒..."
-            EnableWindowsFeature "Containers-DisposableClientVM"
-            Write-Host ""
-            return
-        }
-        "EnableWindowsSubsystemForLinux" {
-            Write-Host "> 正在启用适用于 Linux 的 Windows 子系统..."
-            EnableWindowsFeature "VirtualMachinePlatform"
-            EnableWindowsFeature "Microsoft-Windows-Subsystem-Linux"
-            Write-Host ""
-            return
-        }
-        'ClearStart' {
-            Write-Host "> 正在为用户 $(GetUserName) 移除开始菜单中所有固定的应用..."
-            ReplaceStartMenu
-            Write-Host ""
-            return
-        }
-        'ReplaceStart' {
-            Write-Host "> 正在替换用户 $(GetUserName) 的开始菜单..."
-            ReplaceStartMenu $script:Params.Item("ReplaceStart")
-            Write-Host ""
-            return
-        }
-        'ClearStartAllUsers' {
-            ReplaceStartMenuForAllUsers
-            return
-        }
-        'ReplaceStartAllUsers' {
-            ReplaceStartMenuForAllUsers $script:Params.Item("ReplaceStartAllUsers")
-            return
-        }
-        'DisableStoreSearchSuggestions' {
-            if ($script:Params.ContainsKey("Sysprep")) {
-                Write-Host "> 正在为所有用户禁用开始菜单中的 Microsoft Store 搜索建议..."
-                DisableStoreSearchSuggestionsForAllUsers
-                Write-Host ""
-                return
-            }
-
-            Write-Host "> 正在禁用用户 $(GetUserName) 的 Microsoft Store 搜索建议..."
-            DisableStoreSearchSuggestions
-            Write-Host ""
-            return
-        }
-    }
-}
-
-
-# Executes all selected parameters/features
-# Parameters:
-function ExecuteAllChanges {    
-    # Build list of actionable parameters (skip control params and data-only params)
-    $actionableKeys = @()
-    foreach ($paramKey in $script:Params.Keys) {
-        if ($script:ControlParams -contains $paramKey) { continue }
-        if ($paramKey -eq 'Apps') { continue }
-        if ($paramKey -eq 'CreateRestorePoint') { continue }
-        $actionableKeys += $paramKey
-    }
-    
-    $totalSteps = $actionableKeys.Count
-    if ($script:Params.ContainsKey("CreateRestorePoint")) { $totalSteps++ }
-    $currentStep = 0
-    
-    # Create restore point if requested (CLI only - GUI handles this separately)
-    if ($script:Params.ContainsKey("CreateRestorePoint")) {
-        $currentStep++
-        if ($script:ApplyProgressCallback) {
-            & $script:ApplyProgressCallback $currentStep $totalSteps "正在创建系统还原点"
-        }
-        Write-Host "> 正在尝试创建系统还原点..."
-        CreateSystemRestorePoint
-        Write-Host ""
-    }
-    
-    # Execute all parameters
-    foreach ($paramKey in $actionableKeys) {
-        if ($script:CancelRequested) { 
-            return
-        }
-
-        $currentStep++
-        
-        # Get friendly name for the step
-        $stepName = $paramKey
-        if ($script:Features.ContainsKey($paramKey)) {
-            $feature = $script:Features[$paramKey]
-            if ($feature.ApplyText) {
-                # Prefer explicit ApplyText when provided
-                $stepName = $feature.ApplyText
-            } elseif ($feature.Label) {
-                # Fallback: construct a name from Action and Label, or just Label
-                if ($feature.Action) {
-                    $stepName = "$($feature.Action) $($feature.Label)"
-                } else {
-                    $stepName = $feature.Label
-                }
-            }
-        }
-        
-        if ($script:ApplyProgressCallback) {
-            & $script:ApplyProgressCallback $currentStep $totalSteps $stepName
-        }
-        
-        ExecuteParameter -paramKey $paramKey
-    }
-}
+# Threading functions
+. "$PSScriptRoot/Scripts/Threading/DoEvents.ps1"
+. "$PSScriptRoot/Scripts/Threading/Invoke-NonBlocking.ps1"
 
 
 
@@ -753,7 +393,7 @@ if (-not ($script:Params.ContainsKey("Verbose"))) {
     $ProgressPreference = 'SilentlyContinue'
 }
 else {
-    Write-Host "详细模式已启用"
+    Write-Host "已启用详细模式"
     Write-Output ""
     Write-Output "按任意键继续..."
     $null = [System.Console]::ReadKey()
@@ -762,7 +402,7 @@ else {
 }
 
 if ($script:Params.ContainsKey("Sysprep")) {
-    $defaultUserPath = GetUserDirectory -userName "Default"
+    GetUserDirectory -userName "Default" | Out-Null
 
     # Exit script if run in Sysprep mode on Windows 10
     if ($WinVersion -lt 22000) {
@@ -773,10 +413,10 @@ if ($script:Params.ContainsKey("Sysprep")) {
 
 # Ensure that target user exists, if User or AppRemovalTarget parameter was provided
 if ($script:Params.ContainsKey("User")) {
-    $userPath = GetUserDirectory -userName $script:Params.Item("User")
+    GetUserDirectory -userName $script:Params.Item("User") | Out-Null
 }
 if ($script:Params.ContainsKey("AppRemovalTarget")) {
-    $userPath = GetUserDirectory -userName $script:Params.Item("AppRemovalTarget")
+    GetUserDirectory -userName $script:Params.Item("AppRemovalTarget") | Out-Null
 }
 
 # Remove LastUsedSettings.json file if it exists and is empty
@@ -784,9 +424,12 @@ if ((Test-Path $script:SavedSettingsFilePath) -and ([String]::IsNullOrWhiteSpace
     Remove-Item -Path $script:SavedSettingsFilePath -recurse
 }
 
+# Default to CLI mode for deployment-targeted parameters.
+$launchInCLI = $CLI -or $script:Params.ContainsKey("User") -or $script:Params.ContainsKey("Sysprep") -or $script:Params.ContainsKey("AppRemovalTarget")
+
 # Only run the app selection form if the 'RunAppsListGenerator' parameter was passed to the script
 if ($RunAppsListGenerator) {
-    PrintHeader "Custom Apps List Generator"
+    PrintHeader "自定义应用列表生成器"
 
     $result = Show-AppSelectionWindow
 
@@ -795,7 +438,7 @@ if ($RunAppsListGenerator) {
         Write-Host "应用选择窗口已关闭且未保存。" -ForegroundColor Red
     }
     else {
-        Write-Output "您的应用选择已保存到 'CustomAppsList' 文件，位于："
+        Write-Output "您的应用选择已保存至 'CustomAppsList' 文件，位置："
         Write-Host "$PSScriptRoot" -ForegroundColor Yellow
     }
 
@@ -803,32 +446,47 @@ if ($RunAppsListGenerator) {
 }
 
 # Change script execution based on provided parameters or user input
-if ((-not $script:Params.Count) -or $RunDefaults -or $RunDefaultsLite -or $RunSavedSettings -or ($controlParamsCount -eq $script:Params.Count)) {
+if ((-not $script:Params.Count) -or $RunDefaults -or $RunDefaultsLite -or $RunSavedSettings -or $Config -or ($controlParamsCount -eq $script:Params.Count)) {
     if ($RunDefaults -or $RunDefaultsLite) {
         ShowCLIDefaultModeOptions
     }
     elseif ($RunSavedSettings) {
         if (-not (Test-Path $script:SavedSettingsFilePath)) {
-            PrintHeader 'Custom Mode'
-            Write-Error "无法找到 LastUsedSettings.json 文件，未做任何更改"
+            PrintHeader '自定义模式'
+            Write-Error "无法找到 LastUsedSettings.json 文件，未进行任何更改"
             AwaitKeyToExit
         }
 
         ShowCLILastUsedSettings
     }
+    elseif ($Config) {
+        try {
+            ImportConfigToParams -ConfigPath $Config -CurrentBuild $WinVersion -ExpectedVersion '1.0'
+        }
+        catch {
+            Write-Error "$_"
+            AwaitKeyToExit
+        }
+
+        if (-not $Silent) {
+            PrintHeader '自定义模式'
+            PrintPendingChanges
+            PrintHeader '自定义模式'
+        }
+    }
     else {
-        if ($CLI) {
-            $Mode = ShowCLIMenuOptions 
+        if ($launchInCLI) {
+            $Mode = ShowCLIMenuOptions
         }
         else {
             try {
                 $result = Show-MainWindow
-            
+
                 Stop-Transcript
                 Exit
             }
             catch {
-                Write-Warning "无法加载 WPF 图形界面（当前环境不支持），回退到命令行模式"
+                Write-Warning "无法加载 WPF GUI（当前环境不支持），将回退到 CLI 模式"
                 if (-not $Silent) {
                     Write-Host ""
                     Write-Host "按任意键继续..."
@@ -859,13 +517,13 @@ if ((-not $script:Params.Count) -or $RunDefaults -or $RunDefaultsLite -or $RunSa
     }
 }
 else {
-    PrintHeader 'Configuration'
+    PrintHeader '配置'
 }
 
 # If the number of keys in ControlParams equals the number of keys in Params then no modifications/changes were selected
 #  or added by the user, and the script can exit without making any changes.
 if (($controlParamsCount -eq $script:Params.Keys.Count) -or ($script:Params.Keys.Count -eq 1 -and ($script:Params.Keys -contains 'CreateRestorePoint' -or $script:Params.Keys -contains 'Apps'))) {
-    Write-Output "脚本已完成，未做任何更改。"
+    Write-Output "脚本已完成，未进行任何更改。"
     AwaitKeyToExit
 }
 
@@ -878,6 +536,6 @@ RestartExplorer
 Write-Output ""
 Write-Output ""
 Write-Output ""
-Write-Output "脚本执行完成！请检查上方是否有错误。"
+Write-Output "脚本已完成！请查看上方是否有任何错误。"
 
 AwaitKeyToExit

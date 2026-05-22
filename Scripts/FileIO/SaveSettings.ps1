@@ -1,4 +1,4 @@
-# Saves the current settings, excluding control parameters, to 'LastUsedSettings.json' file
+﻿# Saves the current settings, excluding control parameters, to 'LastUsedSettings.json' file
 function SaveSettings {
     $settings = @{
         "Version" = "1.0"
@@ -16,11 +16,8 @@ function SaveSettings {
         }
     }
 
-    try {
-        $settings | ConvertTo-Json -Depth 10 | Set-Content $script:SavedSettingsFilePath
-    }
-    catch {
+    if (-not (SaveToFile -Config $settings -FilePath $script:SavedSettingsFilePath)) {
         Write-Output ""
-        Write-Host "Error: Failed to save settings to LastUsedSettings.json file" -ForegroundColor Red
+        Write-Host "错误：保存设置到 LastUsedSettings.json 文件失败" -ForegroundColor Red
     }
 }
