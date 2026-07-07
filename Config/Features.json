@@ -2,15 +2,15 @@
   "Version": "1.0",
   "Categories": [
     {
-      "Name": "隐私与建议内容",
+      "Name": "Privacy & Suggested Content",
       "Icon": "&#xE72E;"
     },
     {
-      "Name": "系统",
+      "Name": "System",
       "Icon": "&#xe770;"
     },
     {
-      "Name": "开始菜单与搜索",
+      "Name": "Start Menu & Search",
       "Icon": "&#xe8fc;"
     },
     {
@@ -18,35 +18,35 @@
       "Icon": "&#xe794;"
     },
     {
-      "Name": "Windows 更新",
+      "Name": "Windows Update",
       "Icon": "&#xe895;"
     },
     {
-      "Name": "任务栏",
+      "Name": "Taskbar",
       "Icon": "&#xe75b;"
     },
     {
-      "Name": "外观",
+      "Name": "Appearance",
       "Icon": "&#xE771;"
     },
     {
-      "Name": "文件资源管理器",
+      "Name": "File Explorer",
       "Icon": "&#xec50;"
     },
     {
-      "Name": "游戏",
+      "Name": "Gaming",
       "Icon": "&#xE7FC;"
     },
     {
-      "Name": "多任务",
+      "Name": "Multi-tasking",
       "Icon": "&#xE7C4;"
     },
     {
-      "Name": "可选 Windows 功能",
+      "Name": "Optional Windows Features",
       "Icon": "&#xefda;"
     },
     {
-      "Name": "其他",
+      "Name": "Other",
       "Icon": "&#xE713;"
     }
   ],
